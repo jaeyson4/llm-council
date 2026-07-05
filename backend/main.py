@@ -10,7 +10,19 @@ import json
 import asyncio
 
 from . import storage
-from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
+from .council import (
+    run_full_council,
+    generate_conversation_title,
+    stage1_collect_responses,
+    stage2_collect_rankings,
+    stage3_synthesize_final,
+    calculate_aggregate_rankings,
+    stage_a_screening,
+    prepare_deepdive,
+    build_deepdive_query,
+    export_notes_from_report,
+    compute_deepdive_cap,
+)
 
 app = FastAPI(title="LLM Council API")
 
@@ -77,6 +89,15 @@ async def get_conversation(conversation_id: str):
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return conversation
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    """Permanently delete a conversation and its stored messages."""
+    deleted = storage.delete_conversation(conversation_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"status": "deleted", "id": conversation_id}
 
 
 @app.post("/api/conversations/{conversation_id}/message")
@@ -147,21 +168,69 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             if is_first_message:
                 title_task = asyncio.create_task(generate_conversation_title(request.content))
 
-            # Stage 1: Collect responses
+            # --- Stage A: screening (one cheap model, no peer review) ---
+            yield f"data: {json.dumps({'type': 'screening_start'})}\n\n"
+            screening = await stage_a_screening(request.content)
+            shortlist = screening.get("shortlist", [])
+            yield f"data: {json.dumps({'type': 'screening_complete', 'data': {'shortlist': shortlist, 'response': screening.get('response', '')}})}\n\n"
+
+            # --- Prepare deep-dive numbers (Python-computed, cached per ticker) ---
+            prepared = await prepare_deepdive(shortlist) if shortlist else {"metrics": {}, "context": ""}
+            deepdive_context = prepared["context"]
+            metrics_by_ticker = prepared["metrics"]
+            if deepdive_context:
+                yield f"data: {json.dumps({'type': 'market_data', 'data': deepdive_context})}\n\n"
+
+            # Stage B task prompt (fall back to the raw query if nothing was shortlisted)
+            deepdive_query = build_deepdive_query(request.content, screening, shortlist) if shortlist else request.content
+            cap = compute_deepdive_cap(len(shortlist))
+
+            # --- Stage B, step 1: council deep dive ---
             yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
-            stage1_results = await stage1_collect_responses(request.content)
+            stage1_results = await stage1_collect_responses(deepdive_query, deepdive_context, max_tokens=cap)
+
+            # If every council model failed, stop here rather than fabricating a
+            # report from zero input and writing junk notes to the vault (mirrors
+            # the non-streaming run_full_council guard).
+            if not stage1_results:
+                error_stage3 = {"model": "error", "response": "All models failed to respond. Please try again."}
+                yield f"data: {json.dumps({'type': 'stage1_complete', 'data': []})}\n\n"
+                yield f"data: {json.dumps({'type': 'stage3_complete', 'data': error_stage3})}\n\n"
+                if title_task:
+                    title = await title_task
+                    storage.update_conversation_title(conversation_id, title)
+                    yield f"data: {json.dumps({'type': 'title_complete', 'data': {'title': title}})}\n\n"
+                storage.add_assistant_message(conversation_id, [], [], error_stage3)
+                yield f"data: {json.dumps({'type': 'complete'})}\n\n"
+                return
+
             yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
 
-            # Stage 2: Collect rankings
+            # --- Stage B, step 2: peer rankings ---
             yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
-            stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results)
+            stage2_results, label_to_model = await stage2_collect_rankings(deepdive_query, stage1_results, deepdive_context, max_tokens=cap)
             aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
             yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
 
-            # Stage 3: Synthesize final answer
+            # --- Stage B, step 3: chairman synthesis (per-ticker sections) ---
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
-            stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results)
+            stage3_result = await stage3_synthesize_final(
+                deepdive_query, stage1_results, stage2_results, deepdive_context,
+                max_tokens=cap,
+                shortlist_tickers=[item["ticker"] for item in shortlist],
+            )
             yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
+
+            # --- Export each ticker's analysis to Obsidian (best-effort) ---
+            if shortlist:
+                exported = export_notes_from_report(stage3_result.get("response", ""), shortlist, metrics_by_ticker)
+                if exported:
+                    yield f"data: {json.dumps({'type': 'export_complete', 'data': exported})}\n\n"
+            else:
+                # No shortlist -> nothing to export. Log it so an empty screening
+                # result doesn't get mistaken for a broken Obsidian export.
+                print("[obsidian] export skipped: screening produced an empty "
+                      "shortlist, so there are no tickers to write notes for")
 
             # Wait for title generation if it was started
             if title_task:

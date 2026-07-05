@@ -57,6 +57,21 @@ function App() {
     setCurrentConversationId(id);
   };
 
+  const handleDeleteConversation = async (id) => {
+    try {
+      await api.deleteConversation(id);
+      // Drop it from the sidebar list
+      setConversations((prev) => prev.filter((c) => c.id !== id));
+      // If the open conversation was the one deleted, clear the main view
+      if (id === currentConversationId) {
+        setCurrentConversationId(null);
+        setCurrentConversation(null);
+      }
+    } catch (error) {
+      console.error('Failed to delete conversation:', error);
+    }
+  };
+
   const handleSendMessage = async (content) => {
     if (!currentConversationId) return;
 
@@ -72,11 +87,15 @@ function App() {
       // Create a partial assistant message that will be updated progressively
       const assistantMessage = {
         role: 'assistant',
+        screening: null,
+        shortlist: null,
+        exported: null,
         stage1: null,
         stage2: null,
         stage3: null,
         metadata: null,
         loading: {
+          screening: false,
           stage1: false,
           stage2: false,
           stage3: false,
@@ -92,6 +111,45 @@ function App() {
       // Send message with streaming
       await api.sendMessageStream(currentConversationId, content, (eventType, event) => {
         switch (eventType) {
+          case 'screening_start':
+            setCurrentConversation((prev) => {
+              const messages = [...prev.messages];
+              const lastMsg = messages[messages.length - 1];
+              lastMsg.loading.screening = true;
+              return { ...prev, messages };
+            });
+            break;
+
+          case 'screening_complete':
+            setCurrentConversation((prev) => {
+              const messages = [...prev.messages];
+              const lastMsg = messages[messages.length - 1];
+              lastMsg.shortlist = event.data?.shortlist || [];
+              lastMsg.screening = event.data?.response || '';
+              lastMsg.loading.screening = false;
+              return { ...prev, messages };
+            });
+            break;
+
+          case 'market_data':
+            // Python-computed numbers injected into the deep-dive prompts.
+            setCurrentConversation((prev) => {
+              const messages = [...prev.messages];
+              const lastMsg = messages[messages.length - 1];
+              lastMsg.marketData = event.data;
+              return { ...prev, messages };
+            });
+            break;
+
+          case 'export_complete':
+            setCurrentConversation((prev) => {
+              const messages = [...prev.messages];
+              const lastMsg = messages[messages.length - 1];
+              lastMsg.exported = event.data || [];
+              return { ...prev, messages };
+            });
+            break;
+
           case 'stage1_start':
             setCurrentConversation((prev) => {
               const messages = [...prev.messages];
@@ -163,6 +221,20 @@ function App() {
 
           case 'error':
             console.error('Stream error:', event.message);
+            // Clear any in-progress stage spinners so they don't spin forever.
+            setCurrentConversation((prev) => {
+              const messages = [...prev.messages];
+              const lastMsg = messages[messages.length - 1];
+              if (lastMsg && lastMsg.loading) {
+                lastMsg.loading = {
+                  screening: false,
+                  stage1: false,
+                  stage2: false,
+                  stage3: false,
+                };
+              }
+              return { ...prev, messages };
+            });
             setIsLoading(false);
             break;
 
@@ -188,6 +260,7 @@ function App() {
         currentConversationId={currentConversationId}
         onSelectConversation={handleSelectConversation}
         onNewConversation={handleNewConversation}
+        onDeleteConversation={handleDeleteConversation}
       />
       <ChatInterface
         conversation={currentConversation}

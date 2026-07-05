@@ -1,24 +1,71 @@
 """3-stage LLM Council orchestration."""
 
-from typing import List, Dict, Any, Tuple
+import re
+from typing import List, Dict, Any, Tuple, Optional
 from .openrouter import query_models_parallel, query_model
-from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
+from .config import (
+    COUNCIL_MODELS,
+    CHAIRMAN_MODEL,
+    SCREENING_MODEL,
+    SHORTLIST_SIZE,
+    SCREENING_MAX_TOKENS,
+    DEEPDIVE_BASE_TOKENS,
+    DEEPDIVE_TOKENS_PER_TICKER,
+    DEEPDIVE_MAX_TOKENS,
+)
+from . import metrics as metrics_mod
+from . import obsidian
 
 
-async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
+def compute_deepdive_cap(n_tickers: int) -> int:
+    """Per-call output-token budget for Stage B, scaled to the shortlist size so
+    each ticker's structured analysis has room, capped by a hard ceiling."""
+    n = max(1, int(n_tickers or 1))
+    return min(DEEPDIVE_MAX_TOKENS, DEEPDIVE_BASE_TOKENS + DEEPDIVE_TOKENS_PER_TICKER * n)
+
+
+# The structure every deep-dive analysis must follow, for every ticker covered.
+OUTPUT_STRUCTURE = """REQUIRED OUTPUT STRUCTURE — for EACH ticker you cover, use exactly these six labeled sections, in this order:
+1. **Macro/sector context** — the top-down backdrop (rates, cycle, sector dynamics) relevant to this name.
+2. **Bull thesis** — the strongest case for owning it.
+3. **Bear thesis** — the strongest case against it.
+4. **Key numbers + interpretation** — reference the Python-computed figures provided above (valuation, growth, margins, free cash flow, valuation percentile vs its own history, max drawdown, forward base rates) and explain what they imply. Do NOT invent or alter these numbers.
+5. **2-year price targets (base / bull / bear)** — give a 2-year target for each scenario with the key assumptions (growth, exit multiple) behind it. You may adopt or adjust the provided Python scenario targets, but justify any change.
+6. **Thesis-breakers** — the specific, observable events or data points that would prove your thesis wrong."""
+
+
+def _prepend_context(market_context: str, prompt: str) -> str:
+    """Prepend the live market-data block to a prompt, if any data was fetched.
+
+    market_context is an empty string when the question has no recognizable
+    tickers (or data couldn't be fetched), in which case the prompt is returned
+    unchanged — keeping the original flow intact.
+    """
+    if market_context:
+        return f"{market_context}\n\n---\n\n{prompt}"
+    return prompt
+
+
+async def stage1_collect_responses(
+    user_query: str,
+    market_context: str = "",
+    max_tokens: Optional[int] = None
+) -> List[Dict[str, Any]]:
     """
     Stage 1: Collect individual responses from all council models.
 
     Args:
-        user_query: The user's question
+        user_query: The user's question (or Stage B deep-dive task prompt)
+        market_context: Optional live stock-data block prepended to the prompt
+        max_tokens: Optional output token cap per model
 
     Returns:
         List of dicts with 'model' and 'response' keys
     """
-    messages = [{"role": "user", "content": user_query}]
+    messages = [{"role": "user", "content": _prepend_context(market_context, user_query)}]
 
     # Query all models in parallel
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    responses = await query_models_parallel(COUNCIL_MODELS, messages, max_tokens=max_tokens)
 
     # Format results
     stage1_results = []
@@ -34,7 +81,9 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
 
 async def stage2_collect_rankings(
     user_query: str,
-    stage1_results: List[Dict[str, Any]]
+    stage1_results: List[Dict[str, Any]],
+    market_context: str = "",
+    max_tokens: Optional[int] = None
 ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
     """
     Stage 2: Each model ranks the anonymized responses.
@@ -42,6 +91,8 @@ async def stage2_collect_rankings(
     Args:
         user_query: The original user query
         stage1_results: Results from Stage 1
+        market_context: Optional live stock-data block prepended to the prompt
+        max_tokens: Optional output token cap per model
 
     Returns:
         Tuple of (rankings list, label_to_model mapping)
@@ -92,10 +143,10 @@ FINAL RANKING:
 
 Now provide your evaluation and ranking:"""
 
-    messages = [{"role": "user", "content": ranking_prompt}]
+    messages = [{"role": "user", "content": _prepend_context(market_context, ranking_prompt)}]
 
     # Get rankings from all council models in parallel
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    responses = await query_models_parallel(COUNCIL_MODELS, messages, max_tokens=max_tokens)
 
     # Format results
     stage2_results = []
@@ -115,7 +166,10 @@ Now provide your evaluation and ranking:"""
 async def stage3_synthesize_final(
     user_query: str,
     stage1_results: List[Dict[str, Any]],
-    stage2_results: List[Dict[str, Any]]
+    stage2_results: List[Dict[str, Any]],
+    market_context: str = "",
+    max_tokens: Optional[int] = None,
+    shortlist_tickers: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
     Stage 3: Chairman synthesizes final response.
@@ -124,6 +178,11 @@ async def stage3_synthesize_final(
         user_query: The original user query
         stage1_results: Individual model responses from Stage 1
         stage2_results: Rankings from Stage 2
+        market_context: Optional live stock-data block prepended to the prompt
+        max_tokens: Optional output token cap for the chairman
+        shortlist_tickers: When provided, the chairman is told to emit one
+            level-2 section per ticker headed exactly "## <TICKER>", so the
+            report can be split into per-ticker Obsidian notes.
 
     Returns:
         Dict with 'model' and 'response' keys
@@ -156,10 +215,22 @@ Your task as Chairman is to synthesize all of this information into a single, co
 
 Provide a clear, well-reasoned final answer that represents the council's collective wisdom:"""
 
-    messages = [{"role": "user", "content": chairman_prompt}]
+    # In stock-research mode, require a per-ticker structure so the final report
+    # can be split cleanly into one Obsidian note per ticker.
+    if shortlist_tickers:
+        tickers_str = ", ".join(shortlist_tickers)
+        chairman_prompt += f"""
+
+This is a stock research report on: {tickers_str}. Format your report with ONE section per ticker. Begin each ticker's section with a level-2 markdown header that is EXACTLY the ticker symbol and nothing else, e.g. "## {shortlist_tickers[0]}". Within each ticker's section, follow this structure:
+
+{OUTPUT_STRUCTURE}
+
+Base every figure on the Python-computed data provided above; do not invent numbers."""
+
+    messages = [{"role": "user", "content": _prepend_context(market_context, chairman_prompt)}]
 
     # Query the chairman model
-    response = await query_model(CHAIRMAN_MODEL, messages)
+    response = await query_model(CHAIRMAN_MODEL, messages, max_tokens=max_tokens)
 
     if response is None:
         # Fallback if chairman fails
@@ -293,43 +364,300 @@ Title:"""
     return title
 
 
+# ===========================================================================
+# Stage A — Screening (one cheap model, no peer review)
+# ===========================================================================
+async def stage_a_screening(user_query: str) -> Dict[str, Any]:
+    """
+    Stage A: a single cheap model does a top-down (macro -> sectors -> candidates)
+    pass and returns a shortlist of ~SHORTLIST_SIZE tickers, each with a one-line
+    thesis. No peer review. Premium council models are NOT used here.
+
+    Returns a dict: {'model', 'response' (raw text), 'shortlist': [{'ticker','thesis'}]}.
+    """
+    prompt = f"""You are a top-down equity screener. Given the user's request, reason briefly from the top down: macro backdrop -> attractive sectors -> specific candidate stocks.
+
+User request: {user_query}
+
+Then output a shortlist of the {SHORTLIST_SIZE} most promising, liquid, US-listed stocks to research in depth. If the user named specific tickers, include and prioritize them.
+
+Keep any reasoning to a few sentences. Then end with the shortlist in EXACTLY this format (and nothing after it):
+
+SHORTLIST:
+1. TICKER — one-line thesis
+2. TICKER — one-line thesis
+(up to {SHORTLIST_SIZE} lines)
+
+Use real, valid ticker symbols (e.g. NVDA, AAPL). One ticker per line."""
+
+    messages = [{"role": "user", "content": prompt}]
+    response = await query_model(SCREENING_MODEL, messages, max_tokens=SCREENING_MAX_TOKENS)
+
+    raw = response.get("content", "") if response else ""
+    shortlist = parse_shortlist(raw)
+    return {"model": SCREENING_MODEL, "response": raw, "shortlist": shortlist}
+
+
+def parse_shortlist(text: str) -> List[Dict[str, str]]:
+    """Parse the 'SHORTLIST:' section into [{'ticker','thesis'}]. Falls back to
+    scanning the whole text for 'N. TICKER — thesis' lines if the header is
+    missing. De-dupes and caps at SHORTLIST_SIZE."""
+    if not text:
+        return []
+
+    section = text
+    if "SHORTLIST:" in text:
+        section = text.split("SHORTLIST:", 1)[1]
+
+    results: List[Dict[str, str]] = []
+    seen = set()
+    # Lines like: "1. NVDA — thesis" / "1. NVDA - thesis" / "- NVDA: thesis"
+    line_re = re.compile(
+        r'^\s*(?:\d+[.)]|[-*])?\s*\$?([A-Z][A-Z.\-]{0,5})\b\s*[—:\-–]\s*(.+?)\s*$'
+    )
+    for line in section.splitlines():
+        m = line_re.match(line)
+        if not m:
+            continue
+        ticker = m.group(1).upper().strip(".-")
+        thesis = m.group(2).strip()
+        if not ticker or ticker in seen:
+            continue
+        seen.add(ticker)
+        results.append({"ticker": ticker, "thesis": thesis})
+        if len(results) >= SHORTLIST_SIZE:
+            break
+    return results
+
+
+# ===========================================================================
+# Stage B — Deep dive preparation (Python numbers + prompt)
+# ===========================================================================
+async def prepare_deepdive(shortlist: List[Dict[str, str]]) -> Dict[str, Any]:
+    """Fetch Python-computed metrics for every shortlisted ticker (cached, one
+    fetch per ticker) and format them into an injectable context block."""
+    tickers = [item["ticker"] for item in shortlist]
+    metrics_by_ticker = await metrics_mod.get_many_metrics(tickers)
+    context = metrics_mod.format_many_for_prompt(metrics_by_ticker)
+    return {"metrics": metrics_by_ticker, "context": context}
+
+
+def build_deepdive_query(
+    user_query: str,
+    screening: Dict[str, Any],
+    shortlist: List[Dict[str, str]]
+) -> str:
+    """Compose the Stage B task prompt: the user's goal + screening context +
+    shortlist + the required output structure. The Python numbers are injected
+    separately (as the prepended market-data block)."""
+    shortlist_lines = "\n".join(
+        f"- {item['ticker']}: {item['thesis']}" for item in shortlist
+    )
+    screening_text = (screening or {}).get("response", "").strip()
+    return f"""You are a member of an equity research council conducting a DEEP DIVE on a pre-screened shortlist of stocks.
+
+Original user request: {user_query}
+
+Screening (macro -> sector -> candidates) context from the first-pass analyst:
+{screening_text}
+
+Shortlisted tickers to analyze:
+{shortlist_lines}
+
+Analyze EVERY shortlisted ticker above. The Python-computed figures for each are provided in the data block above — cite them and interpret them; never invent numbers.
+
+{OUTPUT_STRUCTURE}
+
+Be concise and decisive. Cover all shortlisted tickers."""
+
+
+# ===========================================================================
+# Obsidian export — split the final report into one note per ticker
+# ===========================================================================
+def _split_report_by_ticker(
+    report_text: str,
+    tickers: List[str],
+    names_by_ticker: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    """Split a markdown report into {ticker: section_text}.
+
+    A header line only starts a ticker's section if it is *ticker-shaped* — i.e.
+    its FIRST word is that ticker's symbol or the first word of its company name
+    ('## NVDA', '## NVDA — NVIDIA', '## NVIDIA (NVDA)', '## NVIDIA Corporation').
+    This deliberately does NOT fire on:
+      - a document title that names several tickers ('# Report: NVDA, AMD, AVGO'),
+      - a sub-header that merely mentions a competitor ('### Competition from AMD'),
+      - an incidental capital letter for single-letter tickers ('### Section V').
+    When a ticker legitimately recurs, the LONGEST block is kept.
+    """
+    if not report_text or not tickers:
+        return {}
+    names_by_ticker = names_by_ticker or {}
+    upper_tickers = [t.upper() for t in tickers]
+
+    # First word of each ticker's company name, for name-only headers.
+    name_first: Dict[str, str] = {}
+    for t in upper_tickers:
+        nm = (names_by_ticker.get(t) or "").strip()
+        if nm:
+            fw = re.split(r"\W+", nm.upper())[0]
+            if fw:
+                name_first[t] = fw
+
+    lines = report_text.splitlines()
+    header_re = re.compile(r"^#{1,4}\s+(.*)$")
+    boundaries: List[tuple] = []  # (line_index, ticker)
+    for i, line in enumerate(lines):
+        hm = header_re.match(line)
+        if not hm:
+            continue
+        header_text = hm.group(1).strip()
+        upper = header_text.upper()
+
+        # Skip headers that name 2+ distinct shortlisted tickers (title/overview).
+        distinct = {
+            t for t in upper_tickers
+            if re.search(rf"(?<![A-Z0-9]){re.escape(t)}(?![A-Z0-9])", upper)
+        }
+        if len(distinct) >= 2:
+            continue
+
+        # The header must START with a ticker symbol or its company's first word.
+        first_tok_m = re.search(r"[A-Za-z0-9.\-]+", header_text)
+        if not first_tok_m:
+            continue
+        first_tok = first_tok_m.group(0).upper().strip(".-")
+        for t in upper_tickers:
+            if first_tok == t or (t in name_first and first_tok == name_first[t]):
+                boundaries.append((i, t))
+                break
+
+    sections: Dict[str, str] = {}
+    for idx, (line_i, ticker) in enumerate(boundaries):
+        end = boundaries[idx + 1][0] if idx + 1 < len(boundaries) else len(lines)
+        body = "\n".join(lines[line_i:end]).strip()
+        # Keep the longest block if a ticker's header appears more than once.
+        if ticker not in sections or len(body) > len(sections[ticker]):
+            sections[ticker] = body
+    return sections
+
+
+def export_notes_from_report(
+    report_text: str,
+    shortlist: List[Dict[str, str]],
+    metrics_by_ticker: Dict[str, Dict[str, Any]]
+) -> List[Dict[str, str]]:
+    """Write one Obsidian note per shortlisted ticker. The note body is that
+    ticker's section of the chairman's report (falling back to its computed
+    figures if no section is found). Frontmatter numbers come from Python.
+    Returns [{'ticker','path'}] for notes actually written."""
+    tickers = [item["ticker"] for item in shortlist]
+    print(f"[obsidian] export_notes_from_report: {len(tickers)} ticker(s) to write -> {tickers}")
+    thesis_by_ticker = {item["ticker"]: item.get("thesis", "") for item in shortlist}
+    names_by_ticker = {
+        t: (metrics_by_ticker.get(t) or {}).get("name", "") for t in tickers
+    }
+    sections = _split_report_by_ticker(report_text, tickers, names_by_ticker)
+
+    written: List[Dict[str, str]] = []
+    for ticker in tickers:
+        metrics = metrics_by_ticker.get(ticker)
+        body = sections.get(ticker)
+        if not body:
+            # No dedicated section parsed — still create a note so the ticker
+            # isn't silently dropped, using its computed figures as the body.
+            figures = metrics_mod.format_metrics_for_prompt(metrics) if metrics else ""
+            body = (
+                "> Per-ticker section could not be extracted from the council "
+                "report; see the app for the full combined analysis.\n\n" + figures
+            )
+        path = obsidian.export_analysis_note(
+            ticker=ticker,
+            analysis_markdown=body,
+            metrics=metrics,
+            thesis=thesis_by_ticker.get(ticker, ""),
+        )
+        if path:
+            written.append({"ticker": ticker, "path": path})
+    print(f"[obsidian] export complete: wrote {len(written)} of {len(tickers)} note(s)")
+    return written
+
+
+# ===========================================================================
+# Orchestration
+# ===========================================================================
 async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
     """
-    Run the complete 3-stage council process.
+    Run the full two-stage stock-research flow:
+      Stage A  — one cheap model screens -> shortlist
+      Stage B  — the full council deep-dives the shortlist with Python numbers
+                 injected, peer-reviews, and the chairman synthesizes a report
+                 which is exported per-ticker to Obsidian.
 
-    Args:
-        user_query: The user's question
-
-    Returns:
-        Tuple of (stage1_results, stage2_results, stage3_result, metadata)
+    Returns (stage1_results, stage2_results, stage3_result, metadata). The
+    stage1/2/3 shapes are unchanged, so the existing UI and storage keep working.
     """
-    # Stage 1: Collect individual responses
-    stage1_results = await stage1_collect_responses(user_query)
+    # --- Stage A: screening ---
+    screening = await stage_a_screening(user_query)
+    shortlist = screening.get("shortlist", [])
 
-    # If no models responded successfully, return error
+    # --- Prepare deep-dive numbers (Python, cached per ticker) ---
+    prepared = await prepare_deepdive(shortlist) if shortlist else {"metrics": {}, "context": ""}
+    deepdive_context = prepared["context"]
+    metrics_by_ticker = prepared["metrics"]
+
+    # The Stage B task prompt (falls back to the raw user query if screening
+    # produced no shortlist, so the app still answers something).
+    deepdive_query = build_deepdive_query(user_query, screening, shortlist) if shortlist else user_query
+    cap = compute_deepdive_cap(len(shortlist))
+
+    # --- Stage B, step 1: council deep dive ---
+    stage1_results = await stage1_collect_responses(
+        deepdive_query, deepdive_context, max_tokens=cap
+    )
     if not stage1_results:
         return [], [], {
             "model": "error",
             "response": "All models failed to respond. Please try again."
-        }, {}
+        }, {
+            "label_to_model": {},
+            "aggregate_rankings": [],
+            "screening": screening,
+            "shortlist": shortlist,
+            "metrics": metrics_by_ticker,
+            "exported_notes": [],
+        }
 
-    # Stage 2: Collect rankings
-    stage2_results, label_to_model = await stage2_collect_rankings(user_query, stage1_results)
-
-    # Calculate aggregate rankings
+    # --- Stage B, step 2: peer rankings ---
+    stage2_results, label_to_model = await stage2_collect_rankings(
+        deepdive_query, stage1_results, deepdive_context, max_tokens=cap
+    )
     aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
 
-    # Stage 3: Synthesize final answer
+    # --- Stage B, step 3: chairman synthesis (per-ticker sections) ---
     stage3_result = await stage3_synthesize_final(
-        user_query,
-        stage1_results,
-        stage2_results
+        deepdive_query, stage1_results, stage2_results, deepdive_context,
+        max_tokens=cap,
+        shortlist_tickers=[item["ticker"] for item in shortlist],
     )
 
-    # Prepare metadata
+    # --- Export each ticker's analysis to Obsidian (best-effort) ---
+    exported = []
+    if shortlist:
+        exported = export_notes_from_report(
+            stage3_result.get("response", ""), shortlist, metrics_by_ticker
+        )
+    else:
+        print("[obsidian] export skipped: screening produced an empty shortlist, "
+              "so there are no tickers to write notes for")
+
     metadata = {
         "label_to_model": label_to_model,
-        "aggregate_rankings": aggregate_rankings
+        "aggregate_rankings": aggregate_rankings,
+        "screening": screening,
+        "shortlist": shortlist,
+        "metrics": metrics_by_ticker,
+        "exported_notes": exported,
     }
 
     return stage1_results, stage2_results, stage3_result, metadata

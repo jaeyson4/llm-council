@@ -55,6 +55,10 @@
   border-radius: 6px;
   cursor: pointer;
   transition: background 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .conversation-item:hover {
@@ -66,13 +70,86 @@
   border: 1px solid #4a90e2;
 }
 
+.conversation-body {
+  flex: 1;
+  min-width: 0; /* let the title truncate instead of pushing the button out */
+}
+
 .conversation-title {
   color: #333;
   font-size: 14px;
   margin-bottom: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .conversation-meta {
   color: #999;
   font-size: 12px;
+}
+
+/* Delete (×) button — subtle, revealed on row hover */
+.delete-conversation-btn {
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: #b0b0b0;
+  font-size: 18px;
+  line-height: 1;
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s, color 0.15s;
+}
+
+.conversation-item:hover .delete-conversation-btn {
+  opacity: 1;
+}
+
+.delete-conversation-btn:hover {
+  background: #fdecea;
+  color: #d93025;
+}
+
+/* Inline confirmation controls (shown after clicking ×) */
+.conversation-confirm {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.confirm-label {
+  font-size: 12px;
+  color: #d93025;
+}
+
+.confirm-delete-btn,
+.cancel-delete-btn {
+  border: none;
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.confirm-delete-btn {
+  background: #d93025;
+  color: #fff;
+}
+
+.confirm-delete-btn:hover {
+  background: #b3261e;
+}
+
+.cancel-delete-btn {
+  background: #e8e8e8;
+  color: #333;
+}
+
+.cancel-delete-btn:hover {
+  background: #dcdcdc;
 }

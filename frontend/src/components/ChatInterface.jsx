@@ -72,6 +72,28 @@ export default function ChatInterface({
                 <div className="assistant-message">
                   <div className="message-label">LLM Council</div>
 
+                  {/* Stage A — Screening (stock-research mode; guarded so
+                      non-stock conversations and old messages render nothing) */}
+                  {msg.loading?.screening && (
+                    <div className="stage-loading">
+                      <div className="spinner"></div>
+                      <span>Running Stage A: Screening candidates...</span>
+                    </div>
+                  )}
+                  {msg.shortlist && msg.shortlist.length > 0 && (
+                    <div className="screening-panel">
+                      <div className="screening-title">Stage A — Shortlist</div>
+                      <ul className="screening-list">
+                        {msg.shortlist.map((item, i) => (
+                          <li key={i}>
+                            <strong>{item.ticker}</strong>
+                            {item.thesis ? ` — ${item.thesis}` : ''}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
                   {/* Stage 1 */}
                   {msg.loading?.stage1 && (
                     <div className="stage-loading">
@@ -104,6 +126,15 @@ export default function ChatInterface({
                     </div>
                   )}
                   {msg.stage3 && <Stage3 finalResponse={msg.stage3} />}
+
+                  {/* Obsidian export status (guarded) */}
+                  {msg.exported && msg.exported.length > 0 && (
+                    <div className="export-status">
+                      📝 Exported {msg.exported.length} note
+                      {msg.exported.length > 1 ? 's' : ''} to Obsidian:{' '}
+                      {msg.exported.map((e) => e.ticker).join(', ')}
+                    </div>
+                  )}
                 </div>
               )}
             </div>

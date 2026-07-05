@@ -179,7 +179,13 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             deepdive_context = prepared["context"]
             metrics_by_ticker = prepared["metrics"]
             if deepdive_context:
+                print(f"[deepdive] injecting live yfinance data for {len(metrics_by_ticker)} "
+                      f"of {len(shortlist)} shortlisted ticker(s): {list(metrics_by_ticker)}")
                 yield f"data: {json.dumps({'type': 'market_data', 'data': deepdive_context})}\n\n"
+            else:
+                print("[deepdive] WARNING: no live market data available — the council will "
+                      "answer from training data only. (Empty shortlist, or yfinance "
+                      "returned nothing for every proposed ticker.)")
 
             # Stage B task prompt (fall back to the raw query if nothing was shortlisted)
             deepdive_query = build_deepdive_query(request.content, screening, shortlist) if shortlist else request.content

@@ -1,8 +1,19 @@
 """OpenRouter API client for making LLM requests."""
 
+import json
 import httpx
 from typing import List, Dict, Any, Optional
 from .config import OPENROUTER_API_KEY, OPENROUTER_API_URL
+
+
+def _snippet(obj: Any, limit: int = 2000) -> str:
+    """Compact, bounded string form of a JSON-ish object for logging, so a full
+    error payload is visible without dumping tens of KB."""
+    try:
+        s = json.dumps(obj, ensure_ascii=False, default=str)
+    except Exception:
+        s = str(obj)
+    return s if len(s) <= limit else s[:limit] + f"… [truncated, {len(s)} chars]"
 
 
 async def query_model(
@@ -46,10 +57,50 @@ async def query_model(
             response.raise_for_status()
 
             data = response.json()
-            message = data['choices'][0]['message']
+
+            # OpenRouter can return HTTP 200 with an error object in the body
+            # (e.g. provider routing failures, content moderation). Surface the
+            # full error so it doesn't masquerade as an empty response.
+            if isinstance(data, dict) and data.get("error"):
+                print(
+                    f"[openrouter] model {model} returned an error body (HTTP 200):\n"
+                    f"  error: {_snippet(data.get('error'))}"
+                )
+                return None
+
+            choices = (data or {}).get("choices")
+            if not choices:
+                print(
+                    f"[openrouter] model {model} returned NO choices — full payload:\n"
+                    f"  {_snippet(data)}"
+                )
+                return None
+
+            choice = choices[0] or {}
+            message = choice.get("message") or {}
+            content = message.get("content")
+
+            # A model that "returns nothing" almost always comes back as HTTP 200
+            # with empty/whitespace content. The usual culprit is a reasoning
+            # model exhausting `max_tokens` on hidden reasoning
+            # (finish_reason="length") — so print the finish reason and usage,
+            # which make the cause self-explanatory, then treat it as a failure
+            # (return None) so callers cleanly EXCLUDE it instead of silently
+            # keeping a blank "successful" response.
+            if content is None or (isinstance(content, str) and not content.strip()):
+                print(
+                    f"[openrouter] model {model} returned EMPTY content — likely the "
+                    f"output token cap was consumed by reasoning, or the content was "
+                    f"filtered. Diagnostics:\n"
+                    f"  finish_reason: {choice.get('finish_reason')} "
+                    f"(native: {choice.get('native_finish_reason')})\n"
+                    f"  usage: {_snippet(data.get('usage'))}\n"
+                    f"  message: {_snippet(message)}"
+                )
+                return None
 
             return {
-                'content': message.get('content'),
+                'content': content,
                 'reasoning_details': message.get('reasoning_details')
             }
 
@@ -58,12 +109,12 @@ async def query_model(
         # actual reason (e.g. "not a valid model ID") lives in the response
         # body, so print the full body to make bad model IDs self-explanatory.
         print(
-            f"Error querying model {model}: HTTP {e.response.status_code} from OpenRouter\n"
-            f"Response body: {e.response.text}"
+            f"[openrouter] error querying model {model}: HTTP {e.response.status_code} "
+            f"from OpenRouter\n  response body: {e.response.text}"
         )
         return None
     except Exception as e:
-        print(f"Error querying model {model}: {e}")
+        print(f"[openrouter] error querying model {model}: {type(e).__name__}: {e}")
         return None
 
 

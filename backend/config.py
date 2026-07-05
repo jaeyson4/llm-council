@@ -36,16 +36,27 @@ CHAIRMAN_MODEL = "anthropic/claude-fable-5"
 # ---------------------------------------------------------------------------
 # Output token caps (bound per-call cost / credit usage)
 # ---------------------------------------------------------------------------
-# Screening is terse (a shortlist + one-liners), so it gets a small cap.
-SCREENING_MAX_TOKENS = 900
+# NOTE ON REASONING MODELS: every model in this council (GPT-5.x, Gemini 3.x,
+# Claude Fable 5, Grok 4.x) is reasoning-capable, and OpenRouter counts hidden
+# reasoning tokens against `max_tokens`. If the cap is too low the model can burn
+# the ENTIRE budget on reasoning and return EMPTY content with
+# finish_reason="length" — which looks exactly like "the model returned nothing".
+# So these caps must be generous enough to cover reasoning + a full answer.
+#
+# Screening is terse (a shortlist + one-liners) but the model still reasons first,
+# so it needs real headroom or it returns an empty shortlist -> no tickers -> the
+# whole live-data flow silently degrades to a training-data-only answer.
+SCREENING_MAX_TOKENS = 2500
 
 # Deep-dive analyses cover EVERY shortlisted ticker with a 6-section structure,
 # so a single fixed cap would truncate the later tickers as the shortlist grows.
 # The per-call budget therefore scales with the number of tickers, up to a hard
 # ceiling that still bounds cost:  min(CEILING, BASE + PER_TICKER * n_tickers).
-DEEPDIVE_BASE_TOKENS = 700
-DEEPDIVE_TOKENS_PER_TICKER = 550
-DEEPDIVE_MAX_TOKENS = 4000  # hard ceiling (cost cap)
+# The ceiling (16k) is chosen to be large enough that answers don't truncate yet
+# within the output limit of every flagship model here.
+DEEPDIVE_BASE_TOKENS = 3000
+DEEPDIVE_TOKENS_PER_TICKER = 2500
+DEEPDIVE_MAX_TOKENS = 16000  # hard ceiling (cost cap)
 
 # ---------------------------------------------------------------------------
 # Market data

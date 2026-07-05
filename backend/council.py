@@ -1,6 +1,7 @@
 """3-stage LLM Council orchestration."""
 
 import re
+from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 from .openrouter import query_models_parallel, query_model
 from .config import (
@@ -395,6 +396,23 @@ Use real, valid ticker symbols (e.g. NVDA, AAPL). One ticker per line."""
 
     raw = response.get("content", "") if response else ""
     shortlist = parse_shortlist(raw)
+
+    # This is the hinge of the whole live-data flow: if the screening model
+    # returns nothing, or its output can't be parsed into tickers, the shortlist
+    # is empty and NO yfinance data gets fetched — the deep dive then answers
+    # from training data only. Make that outcome loud rather than silent.
+    if not response:
+        print(f"[screening] model {SCREENING_MODEL!r} returned nothing (see the "
+              f"[openrouter] diagnostic above) -> empty shortlist -> NO live market "
+              f"data will be fetched.")
+    elif not shortlist:
+        print(f"[screening] model {SCREENING_MODEL!r} responded but no tickers could "
+              f"be parsed from its output -> NO live market data will be fetched. "
+              f"Raw screening output was:\n{raw}")
+    else:
+        print(f"[screening] {SCREENING_MODEL} proposed {len(shortlist)} ticker(s): "
+              f"{[s['ticker'] for s in shortlist]}")
+
     return {"model": SCREENING_MODEL, "response": raw, "shortlist": shortlist}
 
 
@@ -559,6 +577,15 @@ def export_notes_from_report(
     }
     sections = _split_report_by_ticker(report_text, tickers, names_by_ticker)
 
+    # One run-level date shared by every note and the screening hub, so each
+    # note's `[[Screening <date>]]` link resolves to the note we write below —
+    # even if two tickers' metrics were computed on different days.
+    run_date = next(
+        ((metrics_by_ticker.get(t) or {}).get("as_of")
+         for t in tickers if (metrics_by_ticker.get(t) or {}).get("as_of")),
+        None,
+    ) or datetime.now().strftime("%Y-%m-%d")
+
     written: List[Dict[str, str]] = []
     for ticker in tickers:
         metrics = metrics_by_ticker.get(ticker)
@@ -576,10 +603,15 @@ def export_notes_from_report(
             analysis_markdown=body,
             metrics=metrics,
             thesis=thesis_by_ticker.get(ticker, ""),
+            date=run_date,
         )
         if path:
             written.append({"ticker": ticker, "path": path})
     print(f"[obsidian] export complete: wrote {len(written)} of {len(tickers)} note(s)")
+
+    # The co-screening hub note: lists every screened ticker as a wikilink so
+    # this run's stocks all connect through it in the graph view.
+    obsidian.export_screening_note(tickers, date=run_date)
     return written
 
 
@@ -605,6 +637,15 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
     prepared = await prepare_deepdive(shortlist) if shortlist else {"metrics": {}, "context": ""}
     deepdive_context = prepared["context"]
     metrics_by_ticker = prepared["metrics"]
+
+    # Confirm (or warn) whether real market data actually made it into the run.
+    if deepdive_context:
+        print(f"[deepdive] injecting live yfinance data for {len(metrics_by_ticker)} "
+              f"of {len(shortlist)} shortlisted ticker(s): {list(metrics_by_ticker)}")
+    else:
+        print("[deepdive] WARNING: no live market data available — the council will "
+              "answer from training data only. (Empty shortlist, or yfinance "
+              "returned nothing for every proposed ticker.)")
 
     # The Stage B task prompt (falls back to the raw user query if screening
     # produced no shortlist, so the app still answers something).

@@ -347,7 +347,16 @@ def _forward_returns(close, horizon_days: int):
         beyond = beyond.values if hasattr(beyond, "values") else beyond
         vals[beyond] = float("nan")
         base["pf"] = vals
+        # Non-positive prices poison the return: a genuine 0.0 close (a halted/
+        # delisted/glitched yfinance row survives the numeric coercion upstream,
+        # since 0.0 is numeric and isn't dropped like NaN) makes p0<=0 yield +inf
+        # SILENTLY (pandas float division, no exception, so the except below can't
+        # catch it) and pf<=0 fabricates a -100% return. Null both out so those
+        # windows are dropped rather than injected into the base-rate stats.
+        base.loc[base["p0"] <= 0, "p0"] = float("nan")
+        base.loc[base["pf"] <= 0, "pf"] = float("nan")
         base["fwd"] = base["pf"] / base["p0"] - 1.0
+        base["fwd"] = base["fwd"].replace([float("inf"), float("-inf")], float("nan"))
         return base.dropna(subset=["fwd"])
     except Exception:
         return None
@@ -534,8 +543,22 @@ def _historical_context(info, income, history) -> Dict[str, Any]:
             cond = fwd.assign(pe=pe_on_fwd).dropna(subset=["pe"])
             cond = cond.assign(bucket=cond["pe"].apply(bucket_of))
             sub = cond[cond["bucket"] == cur_bucket]
+            # Report the span of the CONDITIONED sample, not the full valuation
+            # history: the current bucket may occupy only a recent slice of the
+            # P/E history, so passing valuation_window would overstate how much
+            # time this base rate actually covers (mirrors the unconditional
+            # ripe_window above).
+            if len(sub) >= _MIN_BASE_RATE_OBS:
+                bucket_window = {
+                    "start": str(sub.index.min().date()),
+                    "end": str(sub.index.max().date()),
+                    "years": round((sub.index.max() - sub.index.min()).days / 365.25, 1),
+                    "observations": int(len(sub)),
+                }
+            else:
+                bucket_window = valuation_window  # unused; _summarize returns None
             stat = _summarize_forward_returns(
-                sub["fwd"], sub.index, _FWD_HORIZON_DAYS, valuation_window
+                sub["fwd"], sub.index, _FWD_HORIZON_DAYS, bucket_window
             )
             if stat is not None:
                 stat["current_bucket"] = cur_bucket

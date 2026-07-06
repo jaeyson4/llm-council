@@ -130,17 +130,17 @@ async def query_models_parallel(
         models: List of OpenRouter model identifiers
         messages: List of message dicts to send to each model
         max_tokens: Optional shared output token cap. When None (default), each
-            model uses its OWN maximum supported output limit
-            (config.max_tokens_for) rather than a shared ceiling, so no model's
-            response is truncated. Pass an int to force the same cap on all.
+            model uses min(its real API max output, 32000) via
+            config.max_tokens_for rather than a shared ceiling. Pass an int to
+            force the same cap on all.
 
     Returns:
         Dict mapping model identifier to response dict (or None if failed)
     """
     import asyncio
 
-    # Create tasks for all models. Resolve each model's own max output limit when
-    # no shared cap is given, so every model runs at its full capacity.
+    # Create tasks for all models. Resolve each model's min(real max, 32000) cap
+    # when no shared cap is given.
     tasks = [
         query_model(
             model,

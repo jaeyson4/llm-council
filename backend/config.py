@@ -34,7 +34,7 @@ COUNCIL_MODELS = [
 CHAIRMAN_MODEL = "openai/gpt-5.5"
 
 # ---------------------------------------------------------------------------
-# Per-model output token limits (each model at its OWN maximum)
+# Per-model output token limits: min(model's real API max output, 32000)
 # ---------------------------------------------------------------------------
 # NOTE ON REASONING MODELS: every model here (GPT-5.x, Gemini 3.x, Claude Fable
 # 5, Grok 4.x) is reasoning-capable, and OpenRouter counts hidden reasoning
@@ -42,51 +42,54 @@ CHAIRMAN_MODEL = "openai/gpt-5.5"
 # ENTIRE budget on reasoning and return EMPTY content with finish_reason="length"
 # — which looks exactly like "the model returned nothing".
 #
-# For a maximum-quality run we DON'T share one ceiling across models. Each model's
-# max_tokens is set to THAT model's own maximum supported output limit, so answers
-# never truncate. `max_tokens` is only an UPPER BOUND — the model stops when its
-# answer is complete — so raising the cap prevents truncation without adding cost
-# on normal-length answers. We never remove max_tokens (some models default to a
-# small value, or error, when it's omitted), and never set it above the provider's
-# real limit (which would trigger an API error).
+# We cap each model at min(its real API max output, 32000). 32k is far above what
+# our answers actually use (~2-4k tokens plus reasoning), so nothing truncates —
+# but it avoids the enormous cost-reservation the full provider cap triggers.
+# OpenRouter reserves credits up front for (max_tokens * completion price) on
+# EVERY call; at the 128k cap that hold is huge (e.g. claude-fable-5 at $50/1M
+# output => 128000 * $0.00005 = $6.40 reserved per call), which is what produced
+# the HTTP 402 on claude-fable-5. At 32k the same call reserves 32000 * $0.00005
+# = $1.60 — a 4x smaller hold, comfortably within budget. `max_tokens` is only an
+# UPPER BOUND — the model stops when its answer is complete — so lowering it costs
+# nothing on normal-length answers. We never remove max_tokens (some models
+# default to a small value, or error, when it's omitted).
 #
-# Values are each provider's real max completion tokens as advertised by
-# OpenRouter's model catalog (top_provider.max_completion_tokens) — which is also
-# the ceiling OpenRouter itself enforces. Verified live against
-# https://openrouter.ai/api/v1/models on 2026-07-07:
-#   openai/gpt-5.5                 -> 128000  (OpenRouter cap 128000)
-#   google/gemini-3.1-pro-preview  ->  65536  (OpenRouter cap 65536)
-#   anthropic/claude-fable-5       -> 128000  (OpenRouter cap 128000)
-#   x-ai/grok-4.3                  -> 128000  (OpenRouter advertises no completion
-#                                     cap; xAI documents no output limit below the
-#                                     1M context, so 128000 is a safe flagship-tier
-#                                     value, well under every known provider cap)
-#   google/gemini-3.5-flash        ->  65536  (OpenRouter cap 65536; screening)
+# Real provider max output is from OpenRouter's catalog
+# (top_provider.max_completion_tokens), verified live against
+# https://openrouter.ai/api/v1/models on 2026-07-07. Every one is >= 32000, so
+# min(real max, 32000) == 32000 for all five:
+#   openai/gpt-5.5                 -> 128000            => min -> 32000
+#   google/gemini-3.1-pro-preview  ->  65536            => min -> 32000
+#   anthropic/claude-fable-5       -> 128000            => min -> 32000
+#   x-ai/grok-4.3                  -> (no completion cap advertised; xAI documents
+#                                     no output limit below the 1M context)
+#                                                        => min -> 32000
+#   google/gemini-3.5-flash        ->  65536            => min -> 32000 (screening)
 MODEL_MAX_TOKENS = {
-    "openai/gpt-5.5": 128000,
-    "google/gemini-3.1-pro-preview": 65536,
-    "anthropic/claude-fable-5": 128000,
-    "x-ai/grok-4.3": 128000,
-    "google/gemini-3.5-flash": 65536,
+    "openai/gpt-5.5": 32000,
+    "google/gemini-3.1-pro-preview": 32000,
+    "anthropic/claude-fable-5": 32000,
+    "x-ai/grok-4.3": 32000,
+    "google/gemini-3.5-flash": 32000,
 }
 
 # Fallback for any model not listed above (e.g. if the council roster changes).
-# Generous enough that structured reports don't truncate, yet within essentially
-# every flagship provider's output ceiling.
+# Same 32k cap as every listed model: generous enough that structured reports
+# don't truncate, small enough to keep the per-call cost reservation modest.
 DEFAULT_MAX_TOKENS = 32000
 
 
 def max_tokens_for(model: str) -> int:
-    """Return `model`'s OWN maximum supported output limit (see MODEL_MAX_TOKENS).
+    """Return `model`'s output token cap = min(real API max output, 32000).
 
-    Always returns an int, never None — callers should send an explicit
-    max_tokens because some models default to a small value (or error) when it's
-    omitted.
+    See MODEL_MAX_TOKENS. Always returns an int, never None — callers should send
+    an explicit max_tokens because some models default to a small value (or error)
+    when it's omitted.
     """
     return MODEL_MAX_TOKENS.get(model, DEFAULT_MAX_TOKENS)
 
 
-# Screening (Stage A) uses the screening model's own maximum too. It's a terse
+# Screening (Stage A) uses the same min(real max, 32000) cap. It's a terse
 # shortlist, so the model won't get near this — but the cap must clear its hidden
 # reasoning tokens, or it can return an empty shortlist (finish_reason="length")
 # -> no tickers -> the whole live-data flow silently degrades to training-data

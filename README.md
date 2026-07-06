@@ -1,5 +1,7 @@
 # LLM Council — Equity Research Edition
 
+![LLM Council](header.jpg)
+
 An AI-powered stock research tool that puts several frontier LLMs on a "council," feeds them live market data, and has them debate and rank investment ideas together. A Chairman model synthesizes the council's work into a single, structured analysis.
 
 Forked from and inspired by [karpathy/llm-council](https://github.com/karpathy/llm-council). The original is a general-purpose multi-LLM Q&A app; this fork rebuilds it into a disciplined equity-research pipeline with live data, external signals, and note-taking.

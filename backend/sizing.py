@@ -2,9 +2,14 @@
 
 Given the council's finalized ranked picks and a dollar budget, allocate the
 budget across the names. NOTHING here is decided by an LLM: conviction is the
-council's judgment (a number handed in), but every weight, cap, cluster limit,
-dollar amount and share count below is pure arithmetic so the logic is fully
-inspectable and reproducible.
+council's judgment (a number handed in), but every weight, cap, cluster limit
+and dollar amount below is pure arithmetic so the logic is fully inspectable
+and reproducible.
+
+Fractional shares are assumed, so allocation is done purely in dollars: each
+name is deployed at exactly its target weight × budget. No whole-share rounding,
+no "too expensive for one share" carve-outs — the only money left in cash is the
+intended risk buffer (plus any weight the hard caps genuinely couldn't place).
 
 Weighting philosophy
 --------------------
@@ -21,8 +26,8 @@ Weighting philosophy
 4. Every single position is capped, and a cash buffer is always held back.
 
 All of steps 1-4 are logged line-by-line (see `PositionSizing.log`) and rendered
-into a markdown table (ticker | % weight | dollar amount | approx shares |
-rationale) by `render_markdown`.
+into a markdown table (ticker | % weight | dollar amount | rationale) by
+`render_markdown`.
 """
 
 from __future__ import annotations
@@ -66,7 +71,6 @@ class Pick:
     """One ranked candidate handed to the sizer."""
     ticker: str
     conviction: Optional[float] = None       # 0-100, the council's conviction
-    price: Optional[float] = None            # current share price
     volatility: Optional[float] = None       # annualized, decimal
     max_drawdown: Optional[float] = None      # negative decimal (e.g. -0.55)
     sector: Optional[str] = None
@@ -76,14 +80,11 @@ class Pick:
 class SizedRow:
     ticker: str
     weight: float                # final fraction of the WHOLE budget
-    dollars: float               # target dollars (weight * budget), rounded
-    shares: int                  # whole shares affordable at target dollars
-    price: Optional[float]
+    dollars: float               # dollars deployed (weight * budget), fractional
     conviction: float            # normalized 0-100 actually used
     risk: float                  # composite risk actually used
     cluster: Optional[int]       # cluster id (None = singleton)
     rationale: str
-    unaffordable: bool = False   # one share costs more than the allocation
 
 
 @dataclass
@@ -93,8 +94,8 @@ class PositionSizing:
     params: Dict[str, float]
     rows: List[SizedRow]
     clusters: List[List[str]]
-    cash: float                  # dollars held in cash (buffer + un-deployable)
-    invested: float              # dollars actually deployable in whole shares
+    cash: float                  # dollars held in cash (buffer + un-placeable weight)
+    invested: float              # dollars actually deployed across the names
     log: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
 
@@ -348,45 +349,40 @@ def size_positions(
             log.append(f"  {t}: {pre_cap[t]*100:.1f}% → {weights[t]*100:.1f}% "
                        f"({direction} by position/cluster caps).")
 
-    # --- Dollars & whole shares ---
+    # --- Dollars (fractional shares → deploy each name at exactly its weight) ---
     cl_of = {t: ci for ci, cl in enumerate(clusters) for t in cl}
     rows: List[SizedRow] = []
     deployed = 0.0
     for p in picks:
         t = p.ticker
         w = weights[t]
-        dollars = _round_money(w * budget, budget)
-        price = p.price if (p.price and p.price > 0) else None
-        shares = int(w * budget // price) if price else 0
-        unaffordable = bool(price and price > w * budget + 1e-9)
-        if price is None:
-            notes.append(f"{t}: no share price available — showing target weight/$ only "
-                         f"(share count can't be computed).")
-        deployed += shares * price if price else 0.0
+        dollars = w * budget            # exact target dollars; fractional shares allowed
+        deployed += dollars
         ci = cl_of.get(t)
         cluster_id = ci if (ci is not None and len(clusters[ci]) > 1) else None
         rows.append(SizedRow(
-            ticker=t, weight=w, dollars=dollars, shares=shares, price=price,
+            ticker=t, weight=w, dollars=dollars,
             conviction=convictions[t], risk=risk[t], cluster=cluster_id,
             rationale=_rationale(t, convictions[t], risk[t], cluster_id, clusters,
-                                 pre_cap[t], w, pos_cap, cluster_cap, unaffordable, price),
-            unaffordable=unaffordable,
+                                 pre_cap[t], w, pos_cap, cluster_cap),
         ))
 
-    invested_target = sum(r.weight for r in rows) * budget
-    cash = budget - invested_target
+    # Fractional shares mean the deployed dollars equal the computed weights
+    # exactly, so the only money left over is the intended cash buffer (plus any
+    # weight the hard caps couldn't place — reported explicitly below).
+    cash = budget - deployed
+    placed_frac = sum(r.weight for r in rows)
+    dropped = max(0.0, invest_target - placed_frac)  # weight the caps couldn't seat
     log.append(
-        f"Deployed {invested_target/budget*100:.1f}% (${_fmt(invested_target)}); "
+        f"Deployed {deployed/budget*100:.1f}% (${_fmt(deployed)}) at exact target weights; "
         f"holding ${_fmt(cash)} ({cash/budget*100:.1f}%) in cash "
-        f"(buffer {cash_buffer*100:.0f}% + any weight the caps couldn't place)."
+        f"(buffer {cash_buffer*100:.0f}%"
+        + (f" + {dropped*100:.1f}% the caps couldn't place)." if dropped > 1e-6 else ")."
+        )
     )
-    if any(r.unaffordable for r in rows):
-        bad = [r.ticker for r in rows if r.unaffordable]
-        notes.append("Too expensive to buy a whole share at the target allocation: "
-                     + ", ".join(bad) + ".")
 
     return PositionSizing(budget=budget, risk_mode=mode, params=params, rows=rows,
-                          clusters=clusters, cash=cash, invested=invested_target,
+                          clusters=clusters, cash=cash, invested=deployed,
                           log=log, notes=notes)
 
 
@@ -412,21 +408,19 @@ def render_markdown(ps: PositionSizing) -> str:
         lines.append(f"- {entry}")
     lines.append("")
 
-    lines.append("| Ticker | % Weight | Dollar Amount | Approx Shares | Rationale |")
-    lines.append("|---|---:|---:|---:|---|")
+    lines.append("| Ticker | % Weight | Dollar Amount | Rationale |")
+    lines.append("|---|---:|---:|---|")
     for r in ps.rows:
-        share_txt = "—" if r.price is None else (f"⚠ {r.shares}" if r.unaffordable else str(r.shares))
         lines.append(
-            f"| {r.ticker} | {r.weight*100:.1f}% | ${_fmt(r.dollars)} | {share_txt} | {r.rationale} |"
+            f"| {r.ticker} | {r.weight*100:.1f}% | ${_fmt(r.dollars)} | {r.rationale} |"
         )
-    lines.append(f"| **Cash** | **{ps.cash/ps.budget*100:.1f}%** | **${_fmt(ps.cash)}** | — | "
-                 f"Reserve buffer + un-deployable weight |")
+    lines.append(f"| **Cash** | **{ps.cash/ps.budget*100:.1f}%** | **${_fmt(ps.cash)}** | "
+                 f"Reserve buffer + any weight the caps couldn't place |")
     lines.append("")
 
-    deployable = sum((r.shares * r.price) for r in ps.rows if r.price)
-    lines.append(f"*Deployable in whole shares now: ${_fmt(deployable)}; "
-                 f"remaining ${_fmt(ps.budget - deployable)} sits in cash "
-                 f"(reserve buffer plus whole-share rounding).*")
+    lines.append(f"*Deployed ${_fmt(ps.invested)} ({ps.invested/ps.budget*100:.1f}%) at exact "
+                 f"target weights (fractional shares); ${_fmt(ps.cash)} "
+                 f"({ps.cash/ps.budget*100:.1f}%) held in cash as the reserve buffer.*")
     if ps.notes:
         lines.append("")
         for n in ps.notes:
@@ -446,11 +440,6 @@ def _median(xs: List[float]) -> Optional[float]:
     return vals[mid] if n % 2 else (vals[mid - 1] + vals[mid]) / 2.0
 
 
-def _round_money(x: float, budget: float) -> float:
-    """Round to whole dollars for real-world budgets, cents for tiny ones."""
-    return round(x, 0) if budget >= 1000 else round(x, 2)
-
-
 def _fmt(x: float) -> str:
     """Thousands-separated dollar string; whole dollars unless sub-$100."""
     if x is None:
@@ -461,7 +450,7 @@ def _fmt(x: float) -> str:
 
 
 def _rationale(ticker, conviction, risk, cluster_id, clusters, pre_w, final_w,
-               pos_cap, cluster_cap, unaffordable, price) -> str:
+               pos_cap, cluster_cap) -> str:
     conv_word = "high" if conviction >= 70 else ("moderate" if conviction >= 45 else "low")
     risk_word = "low" if risk < 0.45 else ("elevated" if risk < 0.70 else "high")
     parts = [f"{conv_word} conviction ({conviction:.0f}/100)",
@@ -472,6 +461,4 @@ def _rationale(ticker, conviction, risk, cluster_id, clusters, pre_w, final_w,
             parts.append("correlated w/ " + ", ".join(peers))
     if final_w < pre_w - 1e-6:
         parts.append(f"trimmed to cap {min(pos_cap, cluster_cap)*100:.0f}%")
-    if unaffordable and price:
-        parts.append(f"⚠ 1 share ≈ ${_fmt(price)} > allocation")
     return "; ".join(parts)

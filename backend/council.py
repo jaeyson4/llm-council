@@ -815,7 +815,6 @@ async def run_position_sizing(
         picks.append(sizing.Pick(
             ticker=t,
             conviction=conv_map.get(t),
-            price=(m.get("price") or {}).get("current"),
             volatility=vol,
             max_drawdown=hist.get("max_drawdown"),
             sector=m.get("sector"),
@@ -835,9 +834,8 @@ async def run_position_sizing(
             "clusters": ps.clusters,
             "positions": [
                 {"ticker": r.ticker, "weight": round(r.weight, 4),
-                 "dollars": r.dollars, "shares": r.shares, "price": r.price,
-                 "conviction": r.conviction, "cluster": r.cluster,
-                 "unaffordable": r.unaffordable}
+                 "dollars": round(r.dollars, 2),
+                 "conviction": r.conviction, "cluster": r.cluster}
                 for r in ps.rows
             ],
             "correlation_window": corr.get("window"),

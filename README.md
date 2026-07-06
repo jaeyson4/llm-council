@@ -1,24 +1,42 @@
-# LLM Council
+# LLM Council — Equity Research Edition
 
-![llmcouncil](header.jpg)
+An AI-powered stock research tool that puts several frontier LLMs on a "council," feeds them live market data, and has them debate and rank investment ideas together. A Chairman model synthesizes the council's work into a single, structured analysis.
 
-The idea of this repo is that instead of asking a question to your favorite LLM provider (e.g. OpenAI GPT 5.1, Google Gemini 3.0 Pro, Anthropic Claude Sonnet 4.5, xAI Grok 4, eg.c), you can group them into your "LLM Council". This repo is a simple, local web app that essentially looks like ChatGPT except it uses OpenRouter to send your query to multiple LLMs, it then asks them to review and rank each other's work, and finally a Chairman LLM produces the final response.
+Forked from and inspired by [karpathy/llm-council](https://github.com/karpathy/llm-council). The original is a general-purpose multi-LLM Q&A app; this fork rebuilds it into a disciplined equity-research pipeline with live data, external signals, and note-taking.
 
-In a bit more detail, here is what happens when you submit a query:
+> **This is a research and learning tool, not financial advice.** It organizes analysis and forces disciplined thinking; it does not predict the future. See [Limitations](#limitations) before doing anything with its output.
 
-1. **Stage 1: First opinions**. The user query is given to all LLMs individually, and the responses are collected. The individual responses are shown in a "tab view", so that the user can inspect them all one by one.
-2. **Stage 2: Review**. Each individual LLM is given the responses of the other LLMs. Under the hood, the LLM identities are anonymized so that the LLM can't play favorites when judging their outputs. The LLM is asked to rank them in accuracy and insight.
-3. **Stage 3: Final response**. The designated Chairman of the LLM Council takes all of the model's responses and compiles them into a single final answer that is presented to the user.
+## What it does
 
-## Vibe Code Alert
+Instead of asking one model "what stocks look good," this runs a structured pipeline that gathers real data first, then has four different models analyze it independently, critique each other, and produce a synthesized verdict — all saved to an Obsidian vault as a dated research journal.
 
-This project was 99% vibe coded as a fun Saturday hack because I wanted to explore and evaluate a number of LLMs side by side in the process of [reading books together with LLMs](https://x.com/karpathy/status/1990577951671509438). It's nice and useful to see multiple responses side by side, and also the cross-opinions of all LLMs on each other's outputs. I'm not going to support it in any way, it's provided here as is for other people's inspiration and I don't intend to improve it. Code is ephemeral now and libraries are over, ask your LLM to change it in whatever way you like.
+## How it works
+
+1. **Stage A — Screening (cheap).** One inexpensive model (`gemini-3.5-flash`) does a top-down macro → sector → candidate pass and returns a shortlist of tickers. Premium models are deliberately not used here to control cost.
+2. **Data enrichment (Python, deterministic).** For every shortlisted ticker, the app pulls data from yfinance and computes — in code, not by the LLM — valuation multiples (P/E, P/S, EV/EBITDA), growth CAGRs, margins, free cash flow, valuation percentiles vs. the stock's own history, forward base rates, and max drawdown.
+3. **Catalyst & thematic layer (external signals).**
+   - **Insider activity:** SEC EDGAR Form 4 filings, parsed to compute net insider buying vs. selling and flag cluster buying.
+   - **Policy/regulatory news:** recent, dated items via the Tavily search API, bounded to control cost.
+   - **Tech-trend / leadership context:** low-confidence signal, clearly labeled.
+   - Every news-based catalyst must be classified by the models as a *durable structural driver* vs. *already priced in*, to resist hype-chasing.
+4. **Stage B — Deep dive (the full council).** Four premium models (`gpt-5.5`, `gemini-3.1-pro-preview`, `claude-fable-5`, `grok-4.3`) each independently analyze the shortlist with all of the above data injected, producing a fixed structure per pick: bull thesis, bear thesis, key numbers, bear/base/bull 2-year price targets with per-stock assumptions, bull-case probability, biggest risk, and a conviction score.
+5. **Adversarial peer review.** Each model reviews the others' work — attacking the weakest pick and naming what would break the strongest — rather than politely agreeing.
+6. **Stage C — Chairman synthesis.** A Chairman model reconciles the council, corrects errors the review surfaced, and produces the final ranked answer.
+7. **Obsidian export.** Each analysis is written to an Obsidian vault as a dated, linked markdown note (ticker, date, price, targets, thesis) — building a searchable research journal over time.
+
+## Features
+
+- Two-stage funnel (cheap screen → premium deep dive) to control credits
+- Live market data computed deterministically in Python (not hallucinated)
+- SEC insider-activity and policy-news signal layers
+- Per-stock scenario assumptions (not one-size-fits-all targets)
+- Adversarial peer review to surface real disagreement
+- Automatic export to an Obsidian research vault
+- Cost controls throughout (token caps that account for reasoning tokens, bounded API calls, shared data cache)
 
 ## Setup
 
-### 1. Install Dependencies
-
-The project uses [uv](https://docs.astral.sh/uv/) for project management.
+Requires [uv](https://docs.astral.sh/uv/), Node.js, and Python 3.10+.
 
 **Backend:**
 ```bash
@@ -32,56 +50,42 @@ npm install
 cd ..
 ```
 
-### 2. Configure API Key
-
-Create a `.env` file in the project root:
-
-```bash
-OPENROUTER_API_KEY=sk-or-v1-...
+**API keys** — create a `.env` file in the project root:
 ```
-
-Get your API key at [openrouter.ai](https://openrouter.ai/). Make sure to purchase the credits you need, or sign up for automatic top up.
-
-### 3. Configure Models (Optional)
-
-Edit `backend/config.py` to customize the council:
-
-```python
-COUNCIL_MODELS = [
-    "openai/gpt-5.1",
-    "google/gemini-3-pro-preview",
-    "anthropic/claude-sonnet-4.5",
-    "x-ai/grok-4",
-]
-
-CHAIRMAN_MODEL = "google/gemini-3-pro-preview"
+OPENROUTER_API_KEY=sk-or-v1-...      # required — get at openrouter.ai
+TAVILY_API_KEY=tvly-...              # optional — enables the news/policy layer (tavily.com)
+OBSIDIAN_VAULT_PATH=/path/to/vault   # optional — where analysis notes are saved
 ```
+SEC EDGAR insider data needs no key. If `TAVILY_API_KEY` or `OBSIDIAN_VAULT_PATH` is missing, those features skip silently and the rest of the pipeline runs unaffected.
 
-## Running the Application
+## Configuration
 
-**Option 1: Use the start script**
+All knobs live in `backend/config.py`: council/chairman models, shortlist size, token caps, cache TTL, and the cost controls for the catalyst and insider layers.
+
+## Running
+
 ```bash
 ./start.sh
 ```
+Then open http://localhost:5173.
 
-**Option 2: Run manually**
+## Tech stack
 
-Terminal 1 (Backend):
-```bash
-uv run python -m backend.main
-```
+- **Backend:** FastAPI (Python 3.10+), async httpx, OpenRouter API, yfinance, pandas
+- **Data/signals:** yfinance, SEC EDGAR (Form 4), Tavily search
+- **Frontend:** React + Vite
+- **Storage:** JSON conversations + Obsidian markdown export
 
-Terminal 2 (Frontend):
-```bash
-cd frontend
-npm run dev
-```
+## Limitations
 
-Then open http://localhost:5173 in your browser.
+Read this before trusting any output.
 
-## Tech Stack
+- **Markets are largely efficient.** Public information an LLM can access is already reflected in prices. Most professional funds fail to beat the S&P 500 over time; this tool has no structural edge they lack.
+- **The models cannot predict the future.** Two-year price targets are formula outputs from stated assumptions, not forecasts. Garbage assumptions produce garbage targets.
+- **Valuation-history stats are shallow.** yfinance provides only ~3 years of fundamentals, so valuation-percentile signals are indicative, not definitive.
+- **Thematic and policy signals are the most hype-prone inputs.** By the time news reaches you, it is usually priced in.
+- **This is not financial advice.** It is a structured research aid. Verify everything independently; do not move real money on its output alone.
 
-- **Backend:** FastAPI (Python 3.10+), async httpx, OpenRouter API
-- **Frontend:** React + Vite, react-markdown for rendering
-- **Storage:** JSON files in `data/conversations/`
-- **Package Management:** uv for Python, npm for JavaScript
+## Credit
+
+Original concept and base app by [Andrej Karpathy](https://github.com/karpathy/llm-council). This fork extends it into an equity-research pipeline.

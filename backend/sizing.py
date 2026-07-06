@@ -271,8 +271,8 @@ def size_positions(
 
     log.append(
         f"Risk mode = {mode}: concentration κ={kappa}, risk-aversion={risk_aversion}, "
-        f"cash buffer={cash_buffer*100:.0f}%, single-name cap={pos_cap*100:.0f}%, "
-        f"correlated-cluster cap={cluster_cap*100:.0f}%."
+        f"cash buffer={_pct(cash_buffer)}, single-name cap={_pct(pos_cap)}, "
+        f"correlated-cluster cap={_pct(cluster_cap)}."
     )
 
     # --- Conviction: fill any missing scores with the median of the rest ---
@@ -323,7 +323,7 @@ def size_positions(
     invest_target = 1.0 - cash_buffer
     weights = {t: raw[t] / raw_sum * invest_target for t in tickers}
     log.append(
-        f"Applied concentration κ={kappa} and normalized to {invest_target*100:.0f}% "
+        f"Applied concentration κ={kappa} and normalized to {_pct(invest_target)} "
         f"invested (pre-cap weights: " +
         ", ".join(f"{t} {weights[t]*100:.1f}%" for t in tickers) + ")."
     )
@@ -335,7 +335,7 @@ def size_positions(
     if multi:
         for c in multi:
             log.append(f"Correlated cluster {{{', '.join(c)}}} — combined weight capped "
-                       f"at {cluster_cap*100:.0f}%.")
+                       f"at {_pct(cluster_cap)}.")
         for e in edges:
             log.append(f"    linked {e}")
     else:
@@ -376,7 +376,7 @@ def size_positions(
     log.append(
         f"Deployed {deployed/budget*100:.1f}% (${_fmt(deployed)}) at exact target weights; "
         f"holding ${_fmt(cash)} ({cash/budget*100:.1f}%) in cash "
-        f"(buffer {cash_buffer*100:.0f}%"
+        f"(buffer {_pct(cash_buffer)}"
         + (f" + {dropped*100:.1f}% the caps couldn't place)." if dropped > 1e-6 else ")."
         )
     )
@@ -449,6 +449,11 @@ def _fmt(x: float) -> str:
     return f"{x:,.2f}"
 
 
+def _pct(frac: float, places: int = 1) -> str:
+    """Percentage string with trailing zeros trimmed: 7.5% not 8%, 10% not 10.0%."""
+    return f"{frac * 100:.{places}f}".rstrip("0").rstrip(".") + "%"
+
+
 def _rationale(ticker, conviction, risk, cluster_id, clusters, pre_w, final_w,
                pos_cap, cluster_cap) -> str:
     conv_word = "high" if conviction >= 70 else ("moderate" if conviction >= 45 else "low")
@@ -460,5 +465,5 @@ def _rationale(ticker, conviction, risk, cluster_id, clusters, pre_w, final_w,
         if peers:
             parts.append("correlated w/ " + ", ".join(peers))
     if final_w < pre_w - 1e-6:
-        parts.append(f"trimmed to cap {min(pos_cap, cluster_cap)*100:.0f}%")
+        parts.append(f"trimmed to cap {_pct(min(pos_cap, cluster_cap))}")
     return "; ".join(parts)

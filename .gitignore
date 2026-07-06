@@ -12,6 +12,9 @@ wheels/
 # Keys and secrets
 .env
 
+# macOS
+.DS_Store
+
 # Data files
 data/
 

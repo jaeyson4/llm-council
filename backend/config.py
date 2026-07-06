@@ -74,6 +74,44 @@ METRICS_CACHE_TTL = 900  # 15 minutes
 # so the rest of the flow is unaffected. The folder is created if missing.
 OBSIDIAN_VAULT_PATH = os.getenv("OBSIDIAN_VAULT_PATH", "/Users/jaeson/Documents/Stock Research")
 
+# ---------------------------------------------------------------------------
+# Catalyst & thematic layer — Tavily (external news signals)
+# ---------------------------------------------------------------------------
+# Tavily search API key (from .env). When empty, the whole catalyst layer is
+# skipped silently and the existing flow is unaffected (same fail-safe posture
+# as the Obsidian export). Get a key at https://tavily.com.
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+TAVILY_API_URL = "https://api.tavily.com/search"
+
+# Cost controls for news pulls (both credits AND prompt tokens). Every knob here
+# is deliberately small so the layer can't blow up as the shortlist grows:
+#   - basic depth  => 1 Tavily credit per search (advanced would be 2)
+#   - 1 search per ticker, so a 5-ticker run = 5 credits for Stage 1
+#   - at most CATALYST_MAX_RESULTS dated items injected per ticker
+CATALYST_SEARCH_DEPTH = "basic"   # 'basic' (1 credit) or 'advanced' (2 credits)
+CATALYST_MAX_RESULTS = 4          # dated items INJECTED per ticker (token cap)
+CATALYST_POLICY_DAYS = 60         # recency window for Stage 1 policy/regulatory news
+# Candidate pool fetched per search before Python relevance-ranks and keeps the
+# top CATALYST_MAX_RESULTS. A bigger pool costs NOTHING extra (Tavily bills per
+# search, not per result) but lets us rank real policy items above market noise.
+CATALYST_CANDIDATE_POOL = 8
+
+# Stage 3 — tech-trend / leadership context (LOW-CONFIDENCE, lowest priority).
+# One extra Tavily search per ticker (so it ~doubles the per-run Tavily credits);
+# set CATALYST_THEME_ENABLED = False to switch it off and keep only Stage 1.
+CATALYST_THEME_ENABLED = True
+CATALYST_THEME_DAYS = 90          # tech trends / exec changes move slower than policy
+
+# ---------------------------------------------------------------------------
+# Insider activity (SEC EDGAR Form 4) — Stage 2 of the catalyst layer
+# ---------------------------------------------------------------------------
+# SEC EDGAR is free and needs no key, but REQUIRES a descriptive User-Agent that
+# identifies the caller with contact info, and rate-limits to 10 requests/sec.
+SEC_USER_AGENT = "llm-council/1.0 (sonj01071@gmail.com)"
+INSIDER_LOOKBACK_MONTHS = 6       # window for the net buy/sell computation (3-6)
+INSIDER_MAX_FILINGS = 25          # Form 4s parsed per ticker (bounds latency + requests)
+INSIDER_CLUSTER_MIN_BUYERS = 3    # distinct open-market buyers => "cluster buying"
+
 # OpenRouter API endpoint
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 

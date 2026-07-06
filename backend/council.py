@@ -1,5 +1,6 @@
 """3-stage LLM Council orchestration."""
 
+import asyncio
 import re
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
@@ -17,6 +18,8 @@ from .config import (
 from . import metrics as metrics_mod
 from . import obsidian
 from . import sizing
+from . import catalysts
+from . import insiders
 
 
 def compute_deepdive_cap(n_tickers: int) -> int:
@@ -473,6 +476,25 @@ async def prepare_deepdive(shortlist: List[Dict[str, str]]) -> Dict[str, Any]:
     tickers = [item["ticker"] for item in shortlist]
     metrics_by_ticker = await metrics_mod.get_many_metrics(tickers)
     context = metrics_mod.format_many_for_prompt(metrics_by_ticker)
+
+    # --- Catalyst & thematic layer: policy/regulatory news (Stage 1, Tavily) and
+    #     SEC EDGAR Form 4 insider activity (Stage 2), fetched CONCURRENTLY so
+    #     their latency overlaps. Both are best-effort and append to the SAME
+    #     context block that is prepended to every council model, the peer-review
+    #     stage, and the chairman — so one fetch feeds the whole council. Either
+    #     failing/being disabled yields '' and leaves the rest of the context
+    #     untouched (existing flow, Obsidian export, scorecard all unaffected). ---
+    catalyst_block, insider_block, theme_block = await asyncio.gather(
+        catalysts.fetch_and_format_policy_news(shortlist, metrics_by_ticker),
+        insiders.fetch_and_format_insider_activity(tickers),
+        catalysts.fetch_and_format_theme_news(shortlist, metrics_by_ticker),
+    )
+    # Order in context: policy (Stage 1) -> insider (Stage 2) -> tech/leadership
+    # (Stage 3, low-confidence, last on purpose).
+    for block in (catalyst_block, insider_block, theme_block):
+        if block:
+            context = f"{context}\n\n---\n\n{block}" if context else block
+
     return {"metrics": metrics_by_ticker, "context": context}
 
 

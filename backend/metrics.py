@@ -1160,6 +1160,39 @@ def format_metrics_for_prompt(m: Dict[str, Any]) -> str:
             seg += "; fundamentals history unavailable"
         lines.append(f"- Data window: {seg}")
 
+    # --- Per-stat lookback audit (how many years EACH statistic actually uses) ---
+    # PRICE-based stats (max drawdown, unconditional 2y base rate) consume the
+    # FULL available price history. FUNDAMENTALS-based stats (valuation percentile,
+    # revenue/EPS CAGR, and the valuation-BUCKETED base rate — whose bucket label
+    # needs a P/E series) are hard-capped by yfinance's ~4 annual statements, so
+    # they are flagged "indicative only" here. Printed per stock so a shallow ~3y
+    # percentile is never misread as having a decades-long base rate's depth.
+    _unc = ((h.get("forward_base_rate_unconditional") or {}).get("window") or {}).get("years")
+    _vp = ((h.get("valuation_percentile") or {}).get("window") or {}).get("years")
+    _bkt = ((h.get("forward_base_rate") or {}).get("window") or {}).get("years")
+    _rc = ((m.get("growth") or {}).get("revenue_cagr") or {}).get("years")
+    _ec = ((m.get("growth") or {}).get("eps_cagr") or {}).get("years")
+    price_stats = []
+    if h.get("max_drawdown") is not None and pw.get("years") is not None:
+        price_stats.append(f"max-drawdown {pw['years']}y")
+    if _unc is not None:
+        price_stats.append(f"unconditional-base-rate {_unc}y")
+    fund_stats = []
+    if _vp is not None:
+        fund_stats.append(f"valuation-percentile {_vp}y")
+    if _rc is not None:
+        fund_stats.append(f"revenue-CAGR {_rc}y")
+    if _ec is not None:
+        fund_stats.append(f"EPS-CAGR {_ec}y")
+    if _bkt is not None:
+        fund_stats.append(f"valuation-bucketed-base-rate {_bkt}y")
+    if price_stats or fund_stats:
+        left = ("PRICE (full history): " + ", ".join(price_stats)) if price_stats else ""
+        right = (("FUNDAMENTALS (yfinance ~4y cap → indicative only): "
+                  + ", ".join(fund_stats))
+                 if fund_stats else "FUNDAMENTALS: unavailable (no annual EPS from yfinance)")
+        lines.append("- Lookback per stat — " + " | ".join(x for x in (left, right) if x))
+
     p = m.get("price", {})
     price = p.get("current")
     chg = p.get("change_pct")
@@ -1176,7 +1209,12 @@ def format_metrics_for_prompt(m: Dict[str, Any]) -> str:
     ec = g.get("eps_cagr")
     rev_str = f"{_pct(rc['value'])} ({rc['years']}y)" if rc else "n/a"
     eps_str = f"{_pct(ec['value'])} ({ec['years']}y)" if ec else "n/a"
-    lines.append(f"- Growth: revenue CAGR {rev_str}, EPS CAGR {eps_str}")
+    # CAGRs are built from yfinance annual statements (~4y ceiling), so tag the
+    # span as fundamentals-limited unless we truly have nothing to report.
+    _gy = (rc or ec or {}).get("years")
+    g_flag = (f"  — limited to {_gy}y of fundamentals, indicative only"
+              if _gy is not None else "")
+    lines.append(f"- Growth: revenue CAGR {rev_str}, EPS CAGR {eps_str}{g_flag}")
 
     mg = m.get("margins", {})
     lines.append(f"- Margins: gross {_pct(mg.get('gross'))}, operating {_pct(mg.get('operating'))}")
@@ -1221,15 +1259,21 @@ def format_metrics_for_prompt(m: Dict[str, Any]) -> str:
         lines.append(
             f"- Valuation percentile: current P/E {vp['current']} (annual-EPS basis) "
             f"sits at the {vp['percentile']:.0f}/100 percentile (0=cheapest, 100=priciest) "
-            f"of its own last ~{w.get('years')}y (median {vp['median']}, n={w.get('observations')})"
+            f"of its own last ~{w.get('years')}y (median {vp['median']}, n={w.get('observations')}) "
+            f"— limited to {w.get('years')}y of fundamentals, indicative only"
         )
     bru = h.get("forward_base_rate_unconditional")
     if bru:
         lines.append(_base_rate_line("unconditional, full history", bru))
     brc = h.get("forward_base_rate")
     if brc:
+        # Unlike the unconditional base rate above (full price history), this one
+        # is bucketed by P/E, which needs annual EPS — so it inherits the ~4y
+        # fundamentals cap and is flagged indicative.
         lines.append(_base_rate_line(
-            f"when P/E in its '{brc.get('current_bucket')}' bucket", brc))
+            f"when P/E in its '{brc.get('current_bucket')}' bucket", brc)
+            + " — bucketing needs annual EPS, so limited to the fundamentals "
+              "window; indicative only")
     for note in h.get("notes", []) or []:
         lines.append(f"- Note: {note}")
 

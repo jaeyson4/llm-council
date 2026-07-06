@@ -31,7 +31,7 @@ COUNCIL_MODELS = [
 ]
 
 # Chairman model - synthesizes final response
-CHAIRMAN_MODEL = "anthropic/claude-fable-5"
+CHAIRMAN_MODEL = "google/gemini-3.1-pro-preview"
 
 # ---------------------------------------------------------------------------
 # Output token caps (bound per-call cost / credit usage)

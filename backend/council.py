@@ -11,22 +11,13 @@ from .config import (
     SCREENING_MODEL,
     SHORTLIST_SIZE,
     SCREENING_MAX_TOKENS,
-    DEEPDIVE_BASE_TOKENS,
-    DEEPDIVE_TOKENS_PER_TICKER,
-    DEEPDIVE_MAX_TOKENS,
+    max_tokens_for,
 )
 from . import metrics as metrics_mod
 from . import obsidian
 from . import sizing
 from . import catalysts
 from . import insiders
-
-
-def compute_deepdive_cap(n_tickers: int) -> int:
-    """Per-call output-token budget for Stage B, scaled to the shortlist size so
-    each ticker's structured analysis has room, capped by a hard ceiling."""
-    n = max(1, int(n_tickers or 1))
-    return min(DEEPDIVE_MAX_TOKENS, DEEPDIVE_BASE_TOKENS + DEEPDIVE_TOKENS_PER_TICKER * n)
 
 
 # The structure every deep-dive analysis must follow, for every ticker covered.
@@ -249,8 +240,13 @@ COUNCIL CONVICTION RANKING:
 
     messages = [{"role": "user", "content": _prepend_context(market_context, chairman_prompt)}]
 
-    # Query the chairman model
-    response = await query_model(CHAIRMAN_MODEL, messages, max_tokens=max_tokens)
+    # Query the chairman model at its own maximum output limit (unless a caller
+    # explicitly overrides the cap), so the synthesized report never truncates.
+    response = await query_model(
+        CHAIRMAN_MODEL,
+        messages,
+        max_tokens=max_tokens if max_tokens is not None else max_tokens_for(CHAIRMAN_MODEL),
+    )
 
     if response is None:
         # Fallback if chairman fails
@@ -884,11 +880,12 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
     # The Stage B task prompt (falls back to the raw user query if screening
     # produced no shortlist, so the app still answers something).
     deepdive_query = build_deepdive_query(user_query, screening, shortlist) if shortlist else user_query
-    cap = compute_deepdive_cap(len(shortlist))
 
+    # Each council model runs at its OWN maximum output limit (resolved per model
+    # in query_models_parallel), so no ticker's analysis is truncated.
     # --- Stage B, step 1: council deep dive ---
     stage1_results = await stage1_collect_responses(
-        deepdive_query, deepdive_context, max_tokens=cap
+        deepdive_query, deepdive_context
     )
     if not stage1_results:
         return [], [], {
@@ -905,7 +902,7 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
 
     # --- Stage B, step 2: peer rankings ---
     stage2_results, label_to_model = await stage2_collect_rankings(
-        deepdive_query, stage1_results, deepdive_context, max_tokens=cap
+        deepdive_query, stage1_results, deepdive_context
     )
     aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
 
@@ -913,7 +910,6 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
     want_sizing = parse_budget(user_query) is not None
     stage3_result = await stage3_synthesize_final(
         deepdive_query, stage1_results, stage2_results, deepdive_context,
-        max_tokens=cap,
         shortlist_tickers=[item["ticker"] for item in shortlist],
         require_conviction=want_sizing,
     )

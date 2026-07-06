@@ -31,32 +31,67 @@ COUNCIL_MODELS = [
 ]
 
 # Chairman model - synthesizes final response
-CHAIRMAN_MODEL = "google/gemini-3.1-pro-preview"
+CHAIRMAN_MODEL = "openai/gpt-5.5"
 
 # ---------------------------------------------------------------------------
-# Output token caps (bound per-call cost / credit usage)
+# Per-model output token limits (each model at its OWN maximum)
 # ---------------------------------------------------------------------------
-# NOTE ON REASONING MODELS: every model in this council (GPT-5.x, Gemini 3.x,
-# Claude Fable 5, Grok 4.x) is reasoning-capable, and OpenRouter counts hidden
-# reasoning tokens against `max_tokens`. If the cap is too low the model can burn
-# the ENTIRE budget on reasoning and return EMPTY content with
-# finish_reason="length" — which looks exactly like "the model returned nothing".
-# So these caps must be generous enough to cover reasoning + a full answer.
+# NOTE ON REASONING MODELS: every model here (GPT-5.x, Gemini 3.x, Claude Fable
+# 5, Grok 4.x) is reasoning-capable, and OpenRouter counts hidden reasoning
+# tokens against `max_tokens`. If the cap is too low the model can burn the
+# ENTIRE budget on reasoning and return EMPTY content with finish_reason="length"
+# — which looks exactly like "the model returned nothing".
 #
-# Screening is terse (a shortlist + one-liners) but the model still reasons first,
-# so it needs real headroom or it returns an empty shortlist -> no tickers -> the
-# whole live-data flow silently degrades to a training-data-only answer.
-SCREENING_MAX_TOKENS = 2500
+# For a maximum-quality run we DON'T share one ceiling across models. Each model's
+# max_tokens is set to THAT model's own maximum supported output limit, so answers
+# never truncate. `max_tokens` is only an UPPER BOUND — the model stops when its
+# answer is complete — so raising the cap prevents truncation without adding cost
+# on normal-length answers. We never remove max_tokens (some models default to a
+# small value, or error, when it's omitted), and never set it above the provider's
+# real limit (which would trigger an API error).
+#
+# Values are each provider's real max completion tokens as advertised by
+# OpenRouter's model catalog (top_provider.max_completion_tokens) — which is also
+# the ceiling OpenRouter itself enforces. Verified live against
+# https://openrouter.ai/api/v1/models on 2026-07-07:
+#   openai/gpt-5.5                 -> 128000  (OpenRouter cap 128000)
+#   google/gemini-3.1-pro-preview  ->  65536  (OpenRouter cap 65536)
+#   anthropic/claude-fable-5       -> 128000  (OpenRouter cap 128000)
+#   x-ai/grok-4.3                  -> 128000  (OpenRouter advertises no completion
+#                                     cap; xAI documents no output limit below the
+#                                     1M context, so 128000 is a safe flagship-tier
+#                                     value, well under every known provider cap)
+#   google/gemini-3.5-flash        ->  65536  (OpenRouter cap 65536; screening)
+MODEL_MAX_TOKENS = {
+    "openai/gpt-5.5": 128000,
+    "google/gemini-3.1-pro-preview": 65536,
+    "anthropic/claude-fable-5": 128000,
+    "x-ai/grok-4.3": 128000,
+    "google/gemini-3.5-flash": 65536,
+}
 
-# Deep-dive analyses cover EVERY shortlisted ticker with a 6-section structure,
-# so a single fixed cap would truncate the later tickers as the shortlist grows.
-# The per-call budget therefore scales with the number of tickers, up to a hard
-# ceiling that still bounds cost:  min(CEILING, BASE + PER_TICKER * n_tickers).
-# The ceiling (16k) is chosen to be large enough that answers don't truncate yet
-# within the output limit of every flagship model here.
-DEEPDIVE_BASE_TOKENS = 3000
-DEEPDIVE_TOKENS_PER_TICKER = 2500
-DEEPDIVE_MAX_TOKENS = 16000  # hard ceiling (cost cap)
+# Fallback for any model not listed above (e.g. if the council roster changes).
+# Generous enough that structured reports don't truncate, yet within essentially
+# every flagship provider's output ceiling.
+DEFAULT_MAX_TOKENS = 32000
+
+
+def max_tokens_for(model: str) -> int:
+    """Return `model`'s OWN maximum supported output limit (see MODEL_MAX_TOKENS).
+
+    Always returns an int, never None — callers should send an explicit
+    max_tokens because some models default to a small value (or error) when it's
+    omitted.
+    """
+    return MODEL_MAX_TOKENS.get(model, DEFAULT_MAX_TOKENS)
+
+
+# Screening (Stage A) uses the screening model's own maximum too. It's a terse
+# shortlist, so the model won't get near this — but the cap must clear its hidden
+# reasoning tokens, or it can return an empty shortlist (finish_reason="length")
+# -> no tickers -> the whole live-data flow silently degrades to training-data
+# answers.
+SCREENING_MAX_TOKENS = max_tokens_for(SCREENING_MODEL)
 
 # ---------------------------------------------------------------------------
 # Market data

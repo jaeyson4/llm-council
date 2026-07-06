@@ -3,7 +3,7 @@
 import json
 import httpx
 from typing import List, Dict, Any, Optional
-from .config import OPENROUTER_API_KEY, OPENROUTER_API_URL
+from .config import OPENROUTER_API_KEY, OPENROUTER_API_URL, max_tokens_for
 
 
 def _snippet(obj: Any, limit: int = 2000) -> str:
@@ -129,15 +129,26 @@ async def query_models_parallel(
     Args:
         models: List of OpenRouter model identifiers
         messages: List of message dicts to send to each model
-        max_tokens: Optional per-call output token cap forwarded to each model.
+        max_tokens: Optional shared output token cap. When None (default), each
+            model uses its OWN maximum supported output limit
+            (config.max_tokens_for) rather than a shared ceiling, so no model's
+            response is truncated. Pass an int to force the same cap on all.
 
     Returns:
         Dict mapping model identifier to response dict (or None if failed)
     """
     import asyncio
 
-    # Create tasks for all models
-    tasks = [query_model(model, messages, max_tokens=max_tokens) for model in models]
+    # Create tasks for all models. Resolve each model's own max output limit when
+    # no shared cap is given, so every model runs at its full capacity.
+    tasks = [
+        query_model(
+            model,
+            messages,
+            max_tokens=max_tokens if max_tokens is not None else max_tokens_for(model),
+        )
+        for model in models
+    ]
 
     # Wait for all to complete
     responses = await asyncio.gather(*tasks)

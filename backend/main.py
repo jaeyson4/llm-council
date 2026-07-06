@@ -21,7 +21,6 @@ from .council import (
     prepare_deepdive,
     build_deepdive_query,
     export_notes_from_report,
-    compute_deepdive_cap,
     parse_budget,
     run_position_sizing,
     strip_conviction_block,
@@ -192,11 +191,13 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
 
             # Stage B task prompt (fall back to the raw query if nothing was shortlisted)
             deepdive_query = build_deepdive_query(request.content, screening, shortlist) if shortlist else request.content
-            cap = compute_deepdive_cap(len(shortlist))
 
+            # Each council model runs at its OWN maximum output limit (resolved
+            # per model in query_models_parallel), so no ticker's analysis is
+            # truncated even as the shortlist grows.
             # --- Stage B, step 1: council deep dive ---
             yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
-            stage1_results = await stage1_collect_responses(deepdive_query, deepdive_context, max_tokens=cap)
+            stage1_results = await stage1_collect_responses(deepdive_query, deepdive_context)
 
             # If every council model failed, stop here rather than fabricating a
             # report from zero input and writing junk notes to the vault (mirrors
@@ -217,7 +218,7 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
 
             # --- Stage B, step 2: peer rankings ---
             yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
-            stage2_results, label_to_model = await stage2_collect_rankings(deepdive_query, stage1_results, deepdive_context, max_tokens=cap)
+            stage2_results, label_to_model = await stage2_collect_rankings(deepdive_query, stage1_results, deepdive_context)
             aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
             yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
 
@@ -226,7 +227,6 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
             stage3_result = await stage3_synthesize_final(
                 deepdive_query, stage1_results, stage2_results, deepdive_context,
-                max_tokens=cap,
                 shortlist_tickers=[item["ticker"] for item in shortlist],
                 require_conviction=want_sizing,
             )

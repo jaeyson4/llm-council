@@ -16,6 +16,7 @@ from .config import (
 )
 from . import metrics as metrics_mod
 from . import obsidian
+from . import sizing
 
 
 def compute_deepdive_cap(n_tickers: int) -> int:
@@ -170,7 +171,8 @@ async def stage3_synthesize_final(
     stage2_results: List[Dict[str, Any]],
     market_context: str = "",
     max_tokens: Optional[int] = None,
-    shortlist_tickers: Optional[List[str]] = None
+    shortlist_tickers: Optional[List[str]] = None,
+    require_conviction: bool = False
 ) -> Dict[str, Any]:
     """
     Stage 3: Chairman synthesizes final response.
@@ -184,6 +186,9 @@ async def stage3_synthesize_final(
         shortlist_tickers: When provided, the chairman is told to emit one
             level-2 section per ticker headed exactly "## <TICKER>", so the
             report can be split into per-ticker Obsidian notes.
+        require_conviction: When True (the user asked for budget-based position
+            sizing), the chairman must also emit a machine-parseable
+            "COUNCIL CONVICTION RANKING" block that feeds the Python sizer.
 
     Returns:
         Dict with 'model' and 'response' keys
@@ -227,6 +232,17 @@ This is a stock research report on: {tickers_str}. Format your report with ONE s
 {OUTPUT_STRUCTURE}
 
 Base every figure on the Python-computed data provided above; do not invent numbers."""
+
+        if require_conviction:
+            tk_example = shortlist_tickers[0]
+            chairman_prompt += f"""
+
+After all the per-ticker sections, the user has requested position sizing, so end the ENTIRE report with a machine-readable conviction block — EXACTLY this format, nothing after it:
+
+COUNCIL CONVICTION RANKING:
+1. {tk_example} — conviction: NN/100
+2. TICKER — conviction: NN/100
+(one line per ticker you covered, ranked HIGHEST to LOWEST conviction; NN is an integer 0-100 capturing the council's overall confidence in the pick as a 2-year holding, weighing thesis strength, valuation, and risk. Use the whole 0-100 range to differentiate the picks — do not bunch them.)"""
 
     messages = [{"role": "user", "content": _prepend_context(market_context, chairman_prompt)}]
 
@@ -616,6 +632,202 @@ def export_notes_from_report(
 
 
 # ===========================================================================
+# Position sizing (optional) — deterministic Python allocation from a budget
+# ===========================================================================
+_BUDGET_LABELLED_RE = re.compile(
+    r'budget\s*(?:of|:|=|is)?\s*\$?\s*([\d][\d,]*(?:\.\d+)?)\s*([kKmM])?', re.I)
+_BUDGET_DOLLAR_RE = re.compile(r'\$\s*([\d][\d,]*(?:\.\d+)?)\s*([kKmM])?')
+_BUDGET_WORDS_RE = re.compile(
+    r'([\d][\d,]*(?:\.\d+)?)\s*([kKmM])?\s*(?:dollars|usd)\b', re.I)
+# Position sizing must be OPT-IN: a bare "$180" (a share price) or "$250 price
+# target" in the query must NOT trigger it. We require an explicit allocation /
+# budget intent word to be present before treating any dollar figure as a budget.
+_BUDGET_INTENT_RE = re.compile(
+    r'\b(budget|allocat\w*|invest\w*|deploy\w*|portfolio|position[\s-]*siz\w*|'
+    r'capital\s+to|to\s+(?:spend|put\s+in|invest|deploy|allocate))\b', re.I)
+_RISK_MODE_RE = re.compile(r'\b(conservative|balanced|aggressive)\b', re.I)
+
+
+def _to_amount(num: str, suffix: Optional[str]) -> Optional[float]:
+    """Turn a captured ('10,000', 'k') into a float, applying k/m multipliers."""
+    try:
+        val = float(num.replace(",", ""))
+    except (ValueError, AttributeError):
+        return None
+    mult = {"k": 1_000, "m": 1_000_000}.get((suffix or "").lower(), 1)
+    return val * mult
+
+
+# Below this, a bare "$N" / "N dollars" (with no "budget" keyword) is treated as
+# an incidental amount — e.g. a "stocks under $50" price filter — NOT a budget.
+# An explicit "budget ..." mention has no floor.
+_BUDGET_FALLBACK_FLOOR = 100.0
+
+
+def parse_budget(text: str) -> Optional[float]:
+    """Extract a position-sizing budget from the user's request — but ONLY when
+    the request actually expresses an allocation/budget intent (the word
+    'budget', 'allocate', 'invest', 'deploy', 'portfolio', ...). This keeps a
+    stray share price ('broke above $180') or price target ('$250 target') from
+    silently triggering position sizing. Once intent is established, take the
+    amount attached to 'budget' if present, else the first plausible '$N' /
+    'N dollars'. Supports commas and k/m suffixes. Returns None otherwise."""
+    if not text or not _BUDGET_INTENT_RE.search(text):
+        return None
+    for rx in (_BUDGET_LABELLED_RE, _BUDGET_DOLLAR_RE, _BUDGET_WORDS_RE):
+        m = rx.search(text)
+        if m:
+            amt = _to_amount(m.group(1), m.group(2))
+            if amt and amt >= _BUDGET_FALLBACK_FLOOR:
+                return amt
+    return None
+
+
+def parse_risk_mode(text: str) -> str:
+    """Extract the risk mode (conservative/balanced/aggressive) from the request;
+    defaults to 'balanced' when unspecified."""
+    if text:
+        m = _RISK_MODE_RE.search(text)
+        if m:
+            return m.group(1).lower()
+    return sizing.DEFAULT_MODE
+
+
+def parse_conviction_ranking(
+    report_text: str, tickers: List[str]
+) -> Tuple[Dict[str, float], List[str]]:
+    """Parse the chairman's 'COUNCIL CONVICTION RANKING' block into
+    ({ticker: conviction 0-100}, ranked_order). Only recognizes the known
+    shortlist tickers (so stray capitalized words aren't mistaken for symbols).
+    Falls back to an empty result if the block is missing/unparseable — the
+    sizer then uses shortlist order and median conviction."""
+    if not report_text or not tickers:
+        return {}, []
+    upper = {t.upper() for t in tickers}
+    section = report_text
+    idx = report_text.upper().rfind("CONVICTION RANKING")
+    if idx != -1:
+        section = report_text[idx:]
+
+    conviction: Dict[str, float] = {}
+    order: List[str] = []
+    seen: set = set()
+    tok_re = re.compile(r'\b([A-Z][A-Z.\-]{0,5})\b')
+    num_re = re.compile(r'(\d{1,3}(?:\.\d+)?)\s*(?:/\s*100)?')
+    for line in section.splitlines():
+        # Find the first token on the line that is one of our tickers.
+        tick = None
+        for cand in tok_re.findall(line):
+            c = cand.upper().strip(".-")
+            if c in upper:
+                tick = c
+                break
+        if not tick or tick in seen:
+            continue
+        seen.add(tick)
+        score = None
+        # Prefer an explicit 'conviction: NN' / 'NN/100'; else any 0-100 int.
+        cm = re.search(r'conviction\D*(\d{1,3}(?:\.\d+)?)', line, re.I) \
+            or re.search(r'(\d{1,3}(?:\.\d+)?)\s*/\s*100', line)
+        if cm:
+            score = float(cm.group(1))
+        else:
+            nums = [float(n) for n in num_re.findall(line)
+                    if n not in (tick,) and 0 <= float(n) <= 100]
+            # Drop a leading list index like "1." if a second number exists.
+            if len(nums) >= 2:
+                score = nums[1]
+            elif len(nums) == 1 and not re.match(r'^\s*\d+[.)]\s', line):
+                score = nums[0]
+        order.append(tick)
+        if score is not None:
+            conviction[tick] = max(0.0, min(100.0, score))
+    return conviction, order
+
+
+_CONVICTION_HEADER_RE = re.compile(
+    r'(?im)^[^\S\n]*#*[^\S\n]*COUNCIL\s+CONVICTION\s+RANKING\b')
+
+
+def strip_conviction_block(report_text: str) -> str:
+    """Remove the machine-readable 'COUNCIL CONVICTION RANKING' block (and
+    anything after it) from the chairman's report. The block is a portfolio-wide
+    listing of every ticker, so it must NOT survive into the per-ticker Obsidian
+    notes (where the report is split by ticker header) nor clutter the displayed
+    report once the Position Sizing table has superseded it. Cuts at the LAST
+    line-start occurrence of the header; a no-op when the block is absent."""
+    if not report_text:
+        return report_text
+    matches = list(_CONVICTION_HEADER_RE.finditer(report_text))
+    if not matches:
+        return report_text
+    return report_text[:matches[-1].start()].rstrip()
+
+
+async def run_position_sizing(
+    user_query: str,
+    shortlist: List[Dict[str, str]],
+    metrics_by_ticker: Dict[str, Dict[str, Any]],
+    report_text: str,
+) -> Optional[Dict[str, Any]]:
+    """If the user supplied a budget, allocate it across the shortlist in Python.
+    Returns {'markdown', 'data'} to append to the report, or None when no budget
+    was requested (or there's nothing to size). All math is done in `sizing`."""
+    budget = parse_budget(user_query)
+    if not budget or not shortlist:
+        return None
+    risk_mode = parse_risk_mode(user_query)
+    tickers = [it["ticker"] for it in shortlist]
+
+    conv_map, ranked = parse_conviction_ranking(report_text, tickers)
+    # Rank by the council's conviction order when we got one; else shortlist order.
+    order = [t for t in ranked if t in tickers]
+    for t in tickers:  # append any covered ticker the chairman omitted
+        if t not in order:
+            order.append(t)
+
+    # Correlations for cluster caps (best-effort; sector fallback inside sizer).
+    corr = await metrics_mod.get_return_correlations_async(tickers)
+
+    picks: List[sizing.Pick] = []
+    for t in order:
+        m = metrics_by_ticker.get(t) or {}
+        hist = m.get("history") or {}
+        vol = (hist.get("volatility") or {}).get("annualized") if hist.get("volatility") else None
+        picks.append(sizing.Pick(
+            ticker=t,
+            conviction=conv_map.get(t),
+            price=(m.get("price") or {}).get("current"),
+            volatility=vol,
+            max_drawdown=hist.get("max_drawdown"),
+            sector=m.get("sector"),
+        ))
+
+    ps = sizing.size_positions(picks, budget, risk_mode, corr_matrix=corr.get("matrix"))
+    print(f"[sizing] budget=${budget:,.0f} mode={risk_mode} "
+          f"conviction_parsed={len(conv_map)}/{len(tickers)} "
+          f"cash=${ps.cash:,.0f} correlations={'yes' if corr.get('matrix') else 'no'}")
+    return {
+        "markdown": sizing.render_markdown(ps),
+        "data": {
+            "budget": ps.budget,
+            "risk_mode": ps.risk_mode,
+            "params": ps.params,
+            "cash": ps.cash,
+            "clusters": ps.clusters,
+            "positions": [
+                {"ticker": r.ticker, "weight": round(r.weight, 4),
+                 "dollars": r.dollars, "shares": r.shares, "price": r.price,
+                 "conviction": r.conviction, "cluster": r.cluster,
+                 "unaffordable": r.unaffordable}
+                for r in ps.rows
+            ],
+            "correlation_window": corr.get("window"),
+        },
+    }
+
+
+# ===========================================================================
 # Orchestration
 # ===========================================================================
 async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
@@ -676,17 +888,35 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
     aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
 
     # --- Stage B, step 3: chairman synthesis (per-ticker sections) ---
+    want_sizing = parse_budget(user_query) is not None
     stage3_result = await stage3_synthesize_final(
         deepdive_query, stage1_results, stage2_results, deepdive_context,
         max_tokens=cap,
         shortlist_tickers=[item["ticker"] for item in shortlist],
+        require_conviction=want_sizing,
     )
+
+    # --- Optional position sizing (Python) when the user gave a budget ---
+    # Parse conviction from the FULL report (which still has the ranking block),
+    # then strip that machine-readable block so it never bleeds into the
+    # per-ticker Obsidian notes or the displayed report.
+    full_report = stage3_result.get("response", "")
+    position_sizing = None
+    if want_sizing and shortlist:
+        position_sizing = await run_position_sizing(
+            user_query, shortlist, metrics_by_ticker, full_report
+        )
+    report_for_export = strip_conviction_block(full_report) if want_sizing else full_report
+    if position_sizing:
+        stage3_result["response"] = report_for_export + "\n\n" + position_sizing["markdown"]
+    elif want_sizing:
+        stage3_result["response"] = report_for_export
 
     # --- Export each ticker's analysis to Obsidian (best-effort) ---
     exported = []
     if shortlist:
         exported = export_notes_from_report(
-            stage3_result.get("response", ""), shortlist, metrics_by_ticker
+            report_for_export, shortlist, metrics_by_ticker
         )
     else:
         print("[obsidian] export skipped: screening produced an empty shortlist, "
@@ -699,6 +929,7 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
         "shortlist": shortlist,
         "metrics": metrics_by_ticker,
         "exported_notes": exported,
+        "position_sizing": position_sizing["data"] if position_sizing else None,
     }
 
     return stage1_results, stage2_results, stage3_result, metadata

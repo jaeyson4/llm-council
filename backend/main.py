@@ -22,6 +22,9 @@ from .council import (
     build_deepdive_query,
     export_notes_from_report,
     compute_deepdive_cap,
+    parse_budget,
+    run_position_sizing,
+    strip_conviction_block,
 )
 
 app = FastAPI(title="LLM Council API")
@@ -219,17 +222,35 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
 
             # --- Stage B, step 3: chairman synthesis (per-ticker sections) ---
+            want_sizing = parse_budget(request.content) is not None
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
             stage3_result = await stage3_synthesize_final(
                 deepdive_query, stage1_results, stage2_results, deepdive_context,
                 max_tokens=cap,
                 shortlist_tickers=[item["ticker"] for item in shortlist],
+                require_conviction=want_sizing,
             )
+
+            # --- Optional Python position sizing when a budget was given ---
+            # Parse conviction from the full report, then strip the ranking block
+            # so it doesn't bleed into per-ticker notes or the displayed report.
+            full_report = stage3_result.get("response", "")
+            report_for_export = full_report
+            if want_sizing and shortlist:
+                position_sizing = await run_position_sizing(
+                    request.content, shortlist, metrics_by_ticker, full_report
+                )
+                report_for_export = strip_conviction_block(full_report)
+                stage3_result["response"] = (
+                    report_for_export + "\n\n" + position_sizing["markdown"]
+                    if position_sizing else report_for_export
+                )
+
             yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
 
             # --- Export each ticker's analysis to Obsidian (best-effort) ---
             if shortlist:
-                exported = export_notes_from_report(stage3_result.get("response", ""), shortlist, metrics_by_ticker)
+                exported = export_notes_from_report(report_for_export, shortlist, metrics_by_ticker)
                 if exported:
                     yield f"data: {json.dumps({'type': 'export_complete', 'data': exported})}\n\n"
             else:

@@ -394,6 +394,7 @@ def _historical_context(info, income, history) -> Dict[str, Any]:
     annual EPS; every stat carries its own window length and sample size."""
     out: Dict[str, Any] = {
         "max_drawdown": None,
+        "volatility": None,
         "price_window": None,
         "valuation_window": None,
         "valuation_percentile": None,
@@ -431,6 +432,25 @@ def _historical_context(info, income, history) -> Dict[str, Any]:
     try:
         running_max = close.cummax()
         out["max_drawdown"] = _num((close / running_max - 1.0).min())
+    except Exception:
+        pass
+
+    # --- Annualized volatility (a risk input for Python position sizing) ---
+    # Trailing ~1 year of daily returns when available (more representative of the
+    # stock's CURRENT risk than its whole multi-year history), annualized by
+    # sqrt(252). Falls back to the full window if fewer than ~60 recent days.
+    try:
+        rets = close.pct_change().dropna()
+        recent = rets.tail(252)
+        used = recent if len(recent) >= 60 else rets
+        if len(used) >= 20:
+            ann_vol = float(used.std(ddof=1) * math.sqrt(252))
+            if math.isfinite(ann_vol) and ann_vol > 0:
+                out["volatility"] = {
+                    "annualized": round(ann_vol, 4),
+                    "observations": int(len(used)),
+                    "window": "trailing ~1y" if used is recent else "full history",
+                }
     except Exception:
         pass
 
@@ -607,6 +627,20 @@ def _derive_scenarios(hist_growth: Optional[float], analyst: Dict[str, Any], met
     base_g = _weighted_mean([(analyst_2y, 2.0), (hist_c, 1.0), (ltg_c, 1.0)])
     if base_g is None:
         base_g = 0.08  # modest default when the stock exposes no growth signal
+
+    # CHANGE 3: cap the BASE-case growth at ~the LOWER of (analyst estimate,
+    # realized historical growth) — never the higher. The blend above can be
+    # dragged up by an optimistic analyst number or a hot LTG, which (together
+    # with multiple expansion) is what made base targets systematically too high.
+    # The base case is meant to be the conservative-but-plausible path, so we
+    # refuse to let it exceed the more sober of the two HARD signals (LTG is a
+    # softer sell-side aspiration and is intentionally excluded from the cap).
+    # The bull case still carries the upside via its spread.
+    cap_signals = [v for v in (analyst_2y, hist_c) if v is not None]
+    base_growth_cap = min(cap_signals) if cap_signals else None
+    base_capped = base_growth_cap is not None and base_g > base_growth_cap
+    if base_capped:
+        base_g = base_growth_cap
     base_g = _clamp(base_g, -0.10, 0.50)
 
     # Spread from (a) growth level, (b) disagreement among signals, (c) analyst
@@ -628,6 +662,8 @@ def _derive_scenarios(hist_growth: Optional[float], analyst: Dict[str, Any], met
     if ltg_c is not None:
         parts.append(f"LTG {ltg_c * 100:.0f}%")
     basis = ("blend of " + ", ".join(parts)) if parts else "default 8% (no growth signal available)"
+    if base_capped:
+        basis += f", base capped at lower signal {base_growth_cap * 100:.0f}%"
 
     return {
         "base": base_g,
@@ -640,6 +676,7 @@ def _derive_scenarios(hist_growth: Optional[float], analyst: Dict[str, Any], met
             "analyst_next_2y": round(analyst_2y, 3) if analyst_2y is not None else None,
             "ltg": round(ltg_c, 3) if ltg_c is not None else None,
             "analyst_dispersion": round(arange, 3) if arange else None,
+            "base_growth_cap": round(base_growth_cap, 3) if base_growth_cap is not None else None,
         },
     }
 
@@ -661,23 +698,40 @@ def _tether_hist_median(hist_median: Optional[float], current: Optional[float]):
     return tethered, (abs(tethered - hist_median) > 1e-9)
 
 
-def _exit_anchor(current: Optional[float], hist_median: Optional[float],
-                 forward: Optional[float], lo: float, hi: float) -> Optional[float]:
-    """Blend today's multiple, the stock's own (tethered) historical-median
-    multiple, and the forward multiple into a mean-reverting exit anchor
-    (historical median weighted highest so exits revert toward the stock's own
-    norm rather than freezing today's multiple). Returns the clamped anchor or
-    None."""
-    anchor = _weighted_mean([(hist_median, 0.5), (current, 0.3), (forward, 0.2)])
-    return _clamp(anchor, lo, hi) if anchor is not None else None
+def _base_exit_multiple(current: Optional[float], used_hist_median: Optional[float]):
+    """BASE-case exit multiple (CHANGE 3): hold FLAT to slightly-LOWER vs the
+    stock's CURRENT multiple, mean-reverting toward its own (tethered) historical
+    median where available — but NEVER above today's multiple. Multiple EXPANSION
+    is reserved for the bull case; letting the base case re-rate upward on top of
+    already-optimistic EPS growth is exactly what made base targets too high.
+
+    - No current multiple: fall back to the median (or None if neither exists).
+    - No median: hold flat at current.
+    - Median present: revert halfway toward it, then floor the result at nothing
+      above current — so a HIGH median can only hold us flat, while a LOW median
+      pulls the base case down. Returns (base_multiple, human_basis_note)."""
+    if current is None or current <= 0:
+        if used_hist_median is not None:
+            return used_hist_median, "hist median (no current multiple)"
+        return None, ""
+    if used_hist_median is None:
+        return current, "flat vs current (no hist median)"
+    reverted = _weighted_mean([(used_hist_median, 0.5), (current, 0.5)])
+    base_mult = min(current, reverted)
+    if base_mult < current - 1e-9:
+        return base_mult, f"current {current:.1f}→{base_mult:.1f} (revert toward hist median)"
+    return current, "flat vs current (median ≥ current)"
 
 
-def _multiple_basis(anchor: float, raw_hist_median: Optional[float], used_hist_median: Optional[float],
-                    tethered: bool, current: Optional[float], forward: Optional[float],
-                    spread: float) -> str:
-    """Human-readable basis string for the exit multiple, keeping the RAW
-    historical median visible even when it was tethered, so the assumption stays
-    sanity-checkable."""
+def _multiple_basis(base_mult: float, base_note: str, raw_hist_median: Optional[float],
+                    used_hist_median: Optional[float], tethered: bool,
+                    current: Optional[float], forward: Optional[float], spread: float,
+                    unit: str = "P/E") -> str:
+    """Human-readable basis for the ASYMMETRIC exit-multiple model (CHANGE 3): the
+    BASE multiple is held flat-to-slightly-lower vs current (mean-reverting toward
+    the stock's own historical median), the BULL case is the ONLY one allowed to
+    expand it, and the BEAR case compresses it. Keeps the RAW historical median
+    visible even when it was tethered so the assumption stays sanity-checkable."""
     src = []
     if raw_hist_median is not None:
         seg = f"hist median {raw_hist_median:.1f}"
@@ -689,7 +743,42 @@ def _multiple_basis(anchor: float, raw_hist_median: Optional[float], used_hist_m
     if forward is not None:
         src.append(f"fwd {forward:.1f}")
     inner = (" (" + ", ".join(src) + ")") if src else ""
-    return f"anchor {anchor:.1f}{inner}, ±{spread * 100:.0f}% by scenario"
+    return (f"base {unit} {base_mult:.1f} [{base_note}]{inner}; "
+            f"bull re-rates +{spread * 100:.0f}% (only bull expands), "
+            f"bear −{spread * 1.3 * 100:.0f}%")
+
+
+def _scenario_multiples(base_mult: float, current: Optional[float],
+                        used_hist_median: Optional[float], spread: float,
+                        lo: float, hi: float) -> Dict[str, float]:
+    """Build the three per-scenario exit multiples from the already-computed BASE
+    multiple (CHANGE 3):
+    - BEAR compresses below base by the fatter 1.3× factor. Unchanged in spirit
+      from the prior model, but referenced to the (flat-to-lower) base so the
+      ordering bear ≤ base ≤ bull is guaranteed — no inversion where a compressed
+      bear multiple accidentally sits above an un-expanded base.
+    - BASE is passed straight through (held flat-to-slightly-lower vs current).
+    - BULL is the ONLY case allowed to EXPAND the multiple: it re-rates up from
+      today's multiple, and for a name trading below its own (tethered) historical
+      norm it may re-rate at least back toward that norm.
+    Bull always re-rates from at least the base multiple, so that when a very low
+    current multiple forces the base up to its floor, bull can't end up below
+    base (which would invert bull < base)."""
+    bull_ref = max(base_mult, current) if (current is not None and current > 0) else base_mult
+    bull_mult = bull_ref * (1 + spread)
+    if used_hist_median is not None and used_hist_median > bull_ref:
+        bull_mult = max(bull_mult, used_hist_median)
+    bear_mult = base_mult * (1 - spread * 1.3)
+    # The sanity floor `lo` must YIELD to a genuinely low current multiple: for a
+    # stock trading at, say, a 3x P/E, flooring the base at 4-5 would push it
+    # ABOVE current (breaking "base never exceeds current") and can invert the
+    # ordering. So the effective floor is min(lo, current) when current is known.
+    eff_lo = min(lo, current) if (current is not None and current > 0) else lo
+    return {
+        "bull": _clamp(bull_mult, eff_lo, hi),
+        "base": _clamp(base_mult, eff_lo, hi),
+        "bear": _clamp(bear_mult, eff_lo, hi),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -727,33 +816,32 @@ def _price_targets(
     scen = _derive_scenarios(hist_growth, analyst, method)
     base_g = scen["base"]
 
-    # Exit-multiple anchor + per-scenario expansion/compression. Higher-growth
-    # names re-rate harder, so the multiple spread scales with base growth.
+    # Exit-multiple model (CHANGE 3), ASYMMETRIC by scenario. The multiple spread
+    # scales with base growth (higher-growth names re-rate harder), but that
+    # re-rating is applied UP only in the bull case; base is held flat-to-lower.
     mult_spread = _clamp(0.10 + 0.30 * abs(base_g), 0.10, 0.35)
     if method == "eps_pe":
         used_hm, tethered = _tether_hist_median(hist_median_pe, current_pe)
-        anchor = _exit_anchor(current_pe, used_hm, forward_pe, 5.0, 50.0)
-        if anchor is None:
-            anchor = _clamp(current_pe or 15.0, 5.0, 50.0)
-        mult_basis = _multiple_basis(anchor, hist_median_pe, used_hm, tethered,
-                                     current_pe, forward_pe, mult_spread)
-        exit_mult = {
-            "bull": _clamp(anchor * (1 + mult_spread), 4.0, 60.0),
-            "base": _clamp(anchor, 4.0, 60.0),
-            "bear": _clamp(anchor * (1 - mult_spread * 1.3), 4.0, 60.0),
-        }
+        base_mult, base_note = _base_exit_multiple(current_pe, used_hm)
+        if base_mult is None:  # no current/median/forward multiple to lean on
+            base_mult, base_note = (current_pe or forward_pe or 15.0), "fallback"
+        # Ceiling only — the (current-aware) floor is applied in _scenario_multiples
+        # so a genuinely low current multiple isn't floored ABOVE current.
+        base_mult = min(base_mult, 50.0)
+        exit_mult = _scenario_multiples(base_mult, current_pe, used_hm, mult_spread, 4.0, 60.0)
+        mult_basis = _multiple_basis(base_mult, base_note, hist_median_pe, used_hm,
+                                     tethered, current_pe, forward_pe, mult_spread)
         per_share, growth_key, mult_key = eps_ttm, "eps_growth", "exit_pe"
     else:
-        anchor = _exit_anchor(current_ps, None, None, 0.3, 30.0)
-        if anchor is None:
-            anchor = _clamp(current_ps or 3.0, 0.3, 30.0)
-        mult_basis = _multiple_basis(anchor, None, None, False,
-                                     current_ps, None, mult_spread)
-        exit_mult = {
-            "bull": _clamp(anchor * (1 + mult_spread), 0.3, 35.0),
-            "base": _clamp(anchor, 0.3, 35.0),
-            "bear": _clamp(anchor * (1 - mult_spread * 1.3), 0.3, 35.0),
-        }
+        # No P/S history is tracked, so the base P/S is simply held flat vs current.
+        base_mult, base_note = _base_exit_multiple(current_ps, None)
+        if base_mult is None:
+            base_mult, base_note = (current_ps or 3.0), "fallback"
+        # Ceiling only — floor (current-aware) handled in _scenario_multiples.
+        base_mult = min(base_mult, 30.0)
+        exit_mult = _scenario_multiples(base_mult, current_ps, None, mult_spread, 0.3, 35.0)
+        mult_basis = _multiple_basis(base_mult, base_note, None, None, False,
+                                     current_ps, None, mult_spread, unit="P/S")
         per_share, growth_key, mult_key = rev_ps, "revenue_growth", "exit_ps"
 
     targets: Dict[str, Any] = {
@@ -942,6 +1030,76 @@ async def get_many_metrics(tickers: List[str]) -> Dict[str, Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Cross-ticker return correlations (for position-sizing cluster caps)
+# ---------------------------------------------------------------------------
+def get_return_correlations(tickers: List[str], lookback_days: int = 504) -> Dict[str, Any]:
+    """Pairwise daily-return correlations for a basket, computed in Python from
+    adjusted closes over ~the trailing `lookback_days` (~2y). Returns
+    {'matrix': {t1: {t2: corr}}, 'window': {...}, 'missing': [tickers w/o data]}.
+    Best-effort: never raises. Fewer than 2 tickers -> empty matrix (nothing to
+    correlate). Used to cluster correlated names so one shared failure mode can't
+    dominate the book."""
+    uniq: List[str] = []
+    for t in tickers:
+        u = (t or "").strip().upper()
+        if u and u not in uniq:
+            uniq.append(u)
+    out: Dict[str, Any] = {"matrix": {}, "window": None, "missing": list(uniq)}
+    if yf is None or pd is None or len(uniq) < 2:
+        return out
+    try:
+        data = yf.download(uniq, period="3y", interval="1d",
+                           auto_adjust=True, progress=False)
+    except Exception:
+        return out
+    if data is None or getattr(data, "empty", True):
+        return out
+
+    # Extract a (dates x tickers) close frame across yfinance's shape variations.
+    close = None
+    try:
+        if hasattr(data.columns, "levels"):  # MultiIndex (multi-ticker download)
+            lvl0 = data.columns.get_level_values(0)
+            lvl1 = data.columns.get_level_values(1)
+            if "Close" in set(lvl0):
+                close = data["Close"]
+            elif "Close" in set(lvl1):
+                close = data.xs("Close", axis=1, level=1)
+        elif "Close" in data.columns:  # single-ticker download
+            close = data["Close"].to_frame(uniq[0])
+    except Exception:
+        close = None
+    if close is None or getattr(close, "empty", True):
+        return out
+
+    try:
+        close = close.apply(pd.to_numeric, errors="coerce")
+        rets = close.pct_change().tail(lookback_days)
+        good = [c for c in close.columns if str(c) in uniq and rets[c].notna().sum() >= 60]
+        out["missing"] = [t for t in uniq if t not in good]
+        if len(good) < 2:
+            return out
+        corr = rets[good].corr()
+        matrix: Dict[str, Dict[str, float]] = {}
+        for a in good:
+            matrix[a] = {}
+            for b in good:
+                v = corr.loc[a, b]
+                matrix[a][b] = round(float(v), 3) if pd.notna(v) else None
+        out["matrix"] = matrix
+        out["window"] = {"lookback_days": int(lookback_days),
+                         "observations": int(rets[good].shape[0])}
+    except Exception:
+        return {"matrix": {}, "window": None, "missing": list(uniq)}
+    return out
+
+
+async def get_return_correlations_async(tickers: List[str], lookback_days: int = 504) -> Dict[str, Any]:
+    """Async wrapper: runs the blocking correlation download in a worker thread."""
+    return await asyncio.to_thread(get_return_correlations, tickers, lookback_days)
+
+
+# ---------------------------------------------------------------------------
 # Formatting for prompt injection
 # ---------------------------------------------------------------------------
 def _pct(x: Optional[float], nd: int = 1) -> str:
@@ -1054,6 +1212,9 @@ def format_metrics_for_prompt(m: Dict[str, Any]) -> str:
     if h.get("max_drawdown") is not None:
         span = f" over ~{pw['years']}y" if pw.get("years") is not None else " (full history)"
         lines.append(f"- Historical max drawdown{span}: {_pct(h['max_drawdown'])}")
+    vol = h.get("volatility")
+    if vol and vol.get("annualized") is not None:
+        lines.append(f"- Annualized volatility ({vol.get('window')}): {_pct(vol['annualized'])}")
     vp = h.get("valuation_percentile")
     if vp:
         w = vp.get("window", {})

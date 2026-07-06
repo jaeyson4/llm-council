@@ -1,0 +1,477 @@
+"""Deterministic budget → position-sizing, computed entirely in Python.
+
+Given the council's finalized ranked picks and a dollar budget, allocate the
+budget across the names. NOTHING here is decided by an LLM: conviction is the
+council's judgment (a number handed in), but every weight, cap, cluster limit,
+dollar amount and share count below is pure arithmetic so the logic is fully
+inspectable and reproducible.
+
+Weighting philosophy
+--------------------
+1. Each name gets a base score that BLENDS its conviction (higher = more) with
+   its risk (lower drawdown/volatility = more). Concretely
+       score = conviction_norm * (median_risk / risk_i) ** risk_aversion
+   so a name carrying the basket's median risk gets an inverse-risk factor of
+   1.0, a safer name gets >1, a riskier name gets <1.
+2. A concentration exponent (kappa) set by the risk mode reshapes those scores:
+   conservative flattens them toward equal weight (diversified), aggressive
+   sharpens them toward the top-ranked names (concentrated).
+3. Correlated names are grouped into clusters (a shared failure mode) and the
+   cluster's COMBINED weight is capped, so one macro shock can't sink the book.
+4. Every single position is capped, and a cash buffer is always held back.
+
+All of steps 1-4 are logged line-by-line (see `PositionSizing.log`) and rendered
+into a markdown table (ticker | % weight | dollar amount | approx shares |
+rationale) by `render_markdown`.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Risk modes — each sets how concentrated the book is and how hard it caps.
+# ---------------------------------------------------------------------------
+# - kappa:         concentration exponent on the score (<1 flatten, >1 sharpen)
+# - risk_aversion: exponent on the inverse-risk factor (higher = punish risk more)
+# - cash_buffer:   fraction of the budget always held in cash
+# - max_position:  hard cap on any single name's weight
+# - cluster_cap:   hard cap on a correlated cluster's COMBINED weight
+RISK_MODES: Dict[str, Dict[str, float]] = {
+    "conservative": {"kappa": 0.6, "risk_aversion": 1.5, "cash_buffer": 0.10,
+                     "max_position": 0.20, "cluster_cap": 0.35},
+    "balanced":     {"kappa": 1.0, "risk_aversion": 1.0, "cash_buffer": 0.075,
+                     "max_position": 0.25, "cluster_cap": 0.45},
+    "aggressive":   {"kappa": 1.8, "risk_aversion": 0.6, "cash_buffer": 0.05,
+                     "max_position": 0.35, "cluster_cap": 0.60},
+}
+DEFAULT_MODE = "balanced"
+
+# Correlation at/above this pairwise threshold links two names into a cluster.
+# 0.60 sits above typical market-beta co-movement (~0.3-0.5 for unrelated large
+# caps) so it captures genuine shared-failure-mode pairs (e.g. two semis) without
+# collapsing an entire diversified basket into one cluster.
+DEFAULT_CORR_THRESHOLD = 0.60
+
+# Fallback risk inputs when a name exposes no history-derived figure.
+_DEFAULT_VOL = 0.40   # annualized
+_DEFAULT_DD = 0.50    # drawdown magnitude
+_CONVICTION_FLOOR = 0.05  # keep normalized conviction strictly positive
+
+
+@dataclass
+class Pick:
+    """One ranked candidate handed to the sizer."""
+    ticker: str
+    conviction: Optional[float] = None       # 0-100, the council's conviction
+    price: Optional[float] = None            # current share price
+    volatility: Optional[float] = None       # annualized, decimal
+    max_drawdown: Optional[float] = None      # negative decimal (e.g. -0.55)
+    sector: Optional[str] = None
+
+
+@dataclass
+class SizedRow:
+    ticker: str
+    weight: float                # final fraction of the WHOLE budget
+    dollars: float               # target dollars (weight * budget), rounded
+    shares: int                  # whole shares affordable at target dollars
+    price: Optional[float]
+    conviction: float            # normalized 0-100 actually used
+    risk: float                  # composite risk actually used
+    cluster: Optional[int]       # cluster id (None = singleton)
+    rationale: str
+    unaffordable: bool = False   # one share costs more than the allocation
+
+
+@dataclass
+class PositionSizing:
+    budget: float
+    risk_mode: str
+    params: Dict[str, float]
+    rows: List[SizedRow]
+    clusters: List[List[str]]
+    cash: float                  # dollars held in cash (buffer + un-deployable)
+    invested: float              # dollars actually deployable in whole shares
+    log: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Clustering (correlated names share a failure mode)
+# ---------------------------------------------------------------------------
+def build_clusters(
+    tickers: List[str],
+    corr_matrix: Optional[Dict[str, Dict[str, float]]],
+    sectors: Optional[Dict[str, str]] = None,
+    threshold: float = DEFAULT_CORR_THRESHOLD,
+) -> Tuple[List[List[str]], List[str]]:
+    """Union tickers into clusters. Two names are linked when their pairwise
+    return correlation is >= threshold; when a pair's correlation is unavailable
+    we fall back to *same sector* as a coarse shared-failure-mode proxy. Returns
+    (clusters, edge_log) where clusters is a list of ticker-lists (order-stable)
+    and edge_log explains why each multi-name cluster formed."""
+    sectors = sectors or {}
+    parent = {t: t for t in tickers}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    edges: List[str] = []
+    for i, a in enumerate(tickers):
+        for b in tickers[i + 1:]:
+            corr = None
+            if corr_matrix and a in corr_matrix and b in corr_matrix.get(a, {}):
+                corr = corr_matrix[a][b]
+            linked = False
+            reason = ""
+            if corr is not None:
+                if corr >= threshold:
+                    linked, reason = True, f"corr {corr:+.2f} ≥ {threshold:.2f}"
+            else:
+                sa, sb = sectors.get(a), sectors.get(b)
+                if sa and sb and sa == sb:
+                    linked, reason = True, f"same sector ({sa}); corr unavailable"
+            if linked:
+                union(a, b)
+                edges.append(f"{a}↔{b}: {reason}")
+
+    groups: Dict[str, List[str]] = {}
+    for t in tickers:
+        groups.setdefault(find(t), []).append(t)
+    # Preserve input order for determinism.
+    clusters = sorted(groups.values(), key=lambda g: tickers.index(g[0]))
+    return clusters, edges
+
+
+# ---------------------------------------------------------------------------
+# Cap projection (per-position + per-cluster), water-filling the freed weight
+# ---------------------------------------------------------------------------
+def _project_caps(
+    weights: Dict[str, float],
+    clusters: List[List[str]],
+    pos_cap: float,
+    cluster_cap: float,
+    max_iter: int = 200,
+) -> Dict[str, float]:
+    """Clamp weights so no single name exceeds `pos_cap` and no cluster's
+    combined weight exceeds `cluster_cap`, redistributing the freed weight to
+    names that still have headroom (in BOTH their position and their cluster).
+    Weight that cannot be placed anywhere is dropped (it becomes extra cash).
+    A final down-only pass guarantees the caps hold exactly in the output."""
+    w = dict(weights)
+    tickers = list(w)
+    cl_of: Dict[str, int] = {t: ci for ci, cl in enumerate(clusters) for t in cl}
+
+    def cluster_sum(ci: int) -> float:
+        return sum(w[t] for t in clusters[ci])
+
+    pool = 0.0
+    for _ in range(max_iter):
+        # 1. Clamp any single position over the cap; freed weight -> pool.
+        for t in tickers:
+            if w[t] > pos_cap:
+                pool += w[t] - pos_cap
+                w[t] = pos_cap
+        # 2. Scale any over-cap cluster back down; freed weight -> pool.
+        for ci, cl in enumerate(clusters):
+            s = cluster_sum(ci)
+            if s > cluster_cap and s > 0:
+                scale = cluster_cap / s
+                for t in cl:
+                    pool += w[t] * (1.0 - scale)
+                    w[t] *= scale
+        if pool <= 1e-12:
+            break
+
+        # 3. Headroom per name = min(position room, its cluster's room).
+        def headroom(t: str) -> float:
+            hp = pos_cap - w[t]
+            ci = cl_of.get(t)
+            hc = math.inf if ci is None else (cluster_cap - cluster_sum(ci))
+            return max(0.0, min(hp, hc))
+
+        total_head = sum(headroom(t) for t in tickers)
+        if total_head <= 1e-12:
+            break  # nowhere to place the pool -> it stays as cash
+        place = min(pool, total_head)
+        # Distribute proportional to headroom: each name gets <= its own room,
+        # so no cap is broken by a single pass (cluster interactions are cleaned
+        # up on the next loop's clamp).
+        for t in tickers:
+            h = headroom(t)
+            if h > 0:
+                w[t] += place * (h / total_head)
+        pool -= place
+
+    # Final safety projection: guarantee caps hold regardless of convergence.
+    for t in tickers:
+        w[t] = min(w[t], pos_cap)
+    for ci, cl in enumerate(clusters):
+        s = cluster_sum(ci)
+        if s > cluster_cap and s > 0:
+            scale = cluster_cap / s
+            for t in cl:
+                w[t] *= scale
+    return w
+
+
+# ---------------------------------------------------------------------------
+# Main entry: size the positions
+# ---------------------------------------------------------------------------
+def size_positions(
+    picks: List[Pick],
+    budget: float,
+    risk_mode: str = DEFAULT_MODE,
+    *,
+    corr_matrix: Optional[Dict[str, Dict[str, float]]] = None,
+    corr_threshold: float = DEFAULT_CORR_THRESHOLD,
+    overrides: Optional[Dict[str, float]] = None,
+) -> PositionSizing:
+    """Allocate `budget` across `picks` (ranked best->worst). Returns a fully
+    populated PositionSizing (rows, clusters, cash, and a step-by-step log of the
+    weighting logic). All dollar/share math is done here in Python."""
+    mode = (risk_mode or DEFAULT_MODE).strip().lower()
+    if mode not in RISK_MODES:
+        mode = DEFAULT_MODE
+    params = dict(RISK_MODES[mode])
+    if overrides:
+        params.update({k: v for k, v in overrides.items() if v is not None})
+
+    log: List[str] = []
+    notes: List[str] = []
+    budget = float(budget)
+
+    # De-dupe while preserving rank order.
+    seen: set = set()
+    picks = [p for p in picks if not (p.ticker in seen or seen.add(p.ticker))]
+    if not picks or budget <= 0:
+        return PositionSizing(budget=budget, risk_mode=mode, params=params, rows=[],
+                              clusters=[], cash=budget, invested=0.0,
+                              log=["No picks or non-positive budget — nothing to size."],
+                              notes=notes)
+
+    tickers = [p.ticker for p in picks]
+    kappa = params["kappa"]
+    risk_aversion = params["risk_aversion"]
+    cash_buffer = params["cash_buffer"]
+    pos_cap = params["max_position"]
+    cluster_cap = params["cluster_cap"]
+
+    log.append(
+        f"Risk mode = {mode}: concentration κ={kappa}, risk-aversion={risk_aversion}, "
+        f"cash buffer={cash_buffer*100:.0f}%, single-name cap={pos_cap*100:.0f}%, "
+        f"correlated-cluster cap={cluster_cap*100:.0f}%."
+    )
+
+    # --- Conviction: fill any missing scores with the median of the rest ---
+    conv_present = [p.conviction for p in picks if p.conviction is not None]
+    conv_median = _median(conv_present) if conv_present else 50.0
+    convictions: Dict[str, float] = {}
+    for p in picks:
+        if p.conviction is None:
+            convictions[p.ticker] = conv_median
+            notes.append(f"{p.ticker}: no council conviction supplied — using basket "
+                         f"median {conv_median:.0f}/100.")
+        else:
+            convictions[p.ticker] = float(p.conviction)
+
+    # --- Risk composite per name (0.6*vol + 0.4*|drawdown|) ---
+    vols_present = [p.volatility for p in picks if p.volatility and p.volatility > 0]
+    dds_present = [abs(p.max_drawdown) for p in picks if p.max_drawdown]
+    vol_fallback = _median(vols_present) if vols_present else _DEFAULT_VOL
+    dd_fallback = _median(dds_present) if dds_present else _DEFAULT_DD
+    risk: Dict[str, float] = {}
+    for p in picks:
+        vol = p.volatility if (p.volatility and p.volatility > 0) else vol_fallback
+        dd = abs(p.max_drawdown) if p.max_drawdown else dd_fallback
+        risk[p.ticker] = 0.6 * vol + 0.4 * dd
+        if not (p.volatility and p.volatility > 0):
+            notes.append(f"{p.ticker}: no volatility — using {vol*100:.0f}% (basket median/default).")
+        if not p.max_drawdown:
+            notes.append(f"{p.ticker}: no drawdown — using −{dd*100:.0f}% (basket median/default).")
+    median_risk = _median(list(risk.values())) or 1.0
+
+    # --- Base scores: conviction blended with inverse relative risk ---
+    scores: Dict[str, float] = {}
+    for t in tickers:
+        conv_norm = max(_CONVICTION_FLOOR, convictions[t] / 100.0)
+        rel_risk = risk[t] / median_risk if median_risk else 1.0
+        inv_risk = (1.0 / rel_risk) ** risk_aversion if rel_risk > 0 else 1.0
+        score = conv_norm * inv_risk
+        scores[t] = score
+        log.append(
+            f"  {t}: conviction {convictions[t]:.0f}/100 (×{conv_norm:.2f}), "
+            f"risk {risk[t]*100:.0f}% = {rel_risk:.2f}× basket median → inverse-risk "
+            f"factor ×{inv_risk:.2f} ⇒ score {score:.3f}"
+        )
+
+    # --- Concentration (kappa) then normalize to the invested fraction ---
+    raw = {t: scores[t] ** kappa for t in tickers}
+    raw_sum = sum(raw.values()) or 1.0
+    invest_target = 1.0 - cash_buffer
+    weights = {t: raw[t] / raw_sum * invest_target for t in tickers}
+    log.append(
+        f"Applied concentration κ={kappa} and normalized to {invest_target*100:.0f}% "
+        f"invested (pre-cap weights: " +
+        ", ".join(f"{t} {weights[t]*100:.1f}%" for t in tickers) + ")."
+    )
+
+    # --- Clusters + cap projection ---
+    sectors = {p.ticker: p.sector for p in picks}
+    clusters, edges = build_clusters(tickers, corr_matrix, sectors, corr_threshold)
+    multi = [c for c in clusters if len(c) > 1]
+    if multi:
+        for c in multi:
+            log.append(f"Correlated cluster {{{', '.join(c)}}} — combined weight capped "
+                       f"at {cluster_cap*100:.0f}%.")
+        for e in edges:
+            log.append(f"    linked {e}")
+    else:
+        log.append("No correlated clusters detected — only single-name caps apply.")
+
+    pre_cap = dict(weights)
+    weights = _project_caps(weights, clusters, pos_cap, cluster_cap)
+    for t in tickers:
+        if abs(weights[t] - pre_cap[t]) > 1e-6:
+            direction = "trimmed" if weights[t] < pre_cap[t] else "raised"
+            log.append(f"  {t}: {pre_cap[t]*100:.1f}% → {weights[t]*100:.1f}% "
+                       f"({direction} by position/cluster caps).")
+
+    # --- Dollars & whole shares ---
+    cl_of = {t: ci for ci, cl in enumerate(clusters) for t in cl}
+    rows: List[SizedRow] = []
+    deployed = 0.0
+    for p in picks:
+        t = p.ticker
+        w = weights[t]
+        dollars = _round_money(w * budget, budget)
+        price = p.price if (p.price and p.price > 0) else None
+        shares = int(w * budget // price) if price else 0
+        unaffordable = bool(price and price > w * budget + 1e-9)
+        if price is None:
+            notes.append(f"{t}: no share price available — showing target weight/$ only "
+                         f"(share count can't be computed).")
+        deployed += shares * price if price else 0.0
+        ci = cl_of.get(t)
+        cluster_id = ci if (ci is not None and len(clusters[ci]) > 1) else None
+        rows.append(SizedRow(
+            ticker=t, weight=w, dollars=dollars, shares=shares, price=price,
+            conviction=convictions[t], risk=risk[t], cluster=cluster_id,
+            rationale=_rationale(t, convictions[t], risk[t], cluster_id, clusters,
+                                 pre_cap[t], w, pos_cap, cluster_cap, unaffordable, price),
+            unaffordable=unaffordable,
+        ))
+
+    invested_target = sum(r.weight for r in rows) * budget
+    cash = budget - invested_target
+    log.append(
+        f"Deployed {invested_target/budget*100:.1f}% (${_fmt(invested_target)}); "
+        f"holding ${_fmt(cash)} ({cash/budget*100:.1f}%) in cash "
+        f"(buffer {cash_buffer*100:.0f}% + any weight the caps couldn't place)."
+    )
+    if any(r.unaffordable for r in rows):
+        bad = [r.ticker for r in rows if r.unaffordable]
+        notes.append("Too expensive to buy a whole share at the target allocation: "
+                     + ", ".join(bad) + ".")
+
+    return PositionSizing(budget=budget, risk_mode=mode, params=params, rows=rows,
+                          clusters=clusters, cash=cash, invested=invested_target,
+                          log=log, notes=notes)
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+def render_markdown(ps: PositionSizing) -> str:
+    """Render the sizing result as a markdown section: the weighting logic, the
+    allocation table, and the cash/notes summary."""
+    lines: List[str] = []
+    lines.append("## Position Sizing")
+    lines.append("")
+    lines.append(f"*Budget ${_fmt(ps.budget)} · risk mode: **{ps.risk_mode}** · "
+                 f"computed in Python (not by the council).*")
+    lines.append("")
+
+    if not ps.rows:
+        lines.append("_No positions to size._")
+        return "\n".join(lines)
+
+    lines.append("**Weighting logic**")
+    for entry in ps.log:
+        lines.append(f"- {entry}")
+    lines.append("")
+
+    lines.append("| Ticker | % Weight | Dollar Amount | Approx Shares | Rationale |")
+    lines.append("|---|---:|---:|---:|---|")
+    for r in ps.rows:
+        share_txt = "—" if r.price is None else (f"⚠ {r.shares}" if r.unaffordable else str(r.shares))
+        lines.append(
+            f"| {r.ticker} | {r.weight*100:.1f}% | ${_fmt(r.dollars)} | {share_txt} | {r.rationale} |"
+        )
+    lines.append(f"| **Cash** | **{ps.cash/ps.budget*100:.1f}%** | **${_fmt(ps.cash)}** | — | "
+                 f"Reserve buffer + un-deployable weight |")
+    lines.append("")
+
+    deployable = sum((r.shares * r.price) for r in ps.rows if r.price)
+    lines.append(f"*Deployable in whole shares now: ${_fmt(deployable)}; "
+                 f"remaining ${_fmt(ps.budget - deployable)} sits in cash "
+                 f"(reserve buffer plus whole-share rounding).*")
+    if ps.notes:
+        lines.append("")
+        for n in ps.notes:
+            lines.append(f"> {n}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+def _median(xs: List[float]) -> Optional[float]:
+    vals = sorted(v for v in xs if v is not None)
+    if not vals:
+        return None
+    n = len(vals)
+    mid = n // 2
+    return vals[mid] if n % 2 else (vals[mid - 1] + vals[mid]) / 2.0
+
+
+def _round_money(x: float, budget: float) -> float:
+    """Round to whole dollars for real-world budgets, cents for tiny ones."""
+    return round(x, 0) if budget >= 1000 else round(x, 2)
+
+
+def _fmt(x: float) -> str:
+    """Thousands-separated dollar string; whole dollars unless sub-$100."""
+    if x is None:
+        return "—"
+    if abs(x) >= 100:
+        return f"{x:,.0f}"
+    return f"{x:,.2f}"
+
+
+def _rationale(ticker, conviction, risk, cluster_id, clusters, pre_w, final_w,
+               pos_cap, cluster_cap, unaffordable, price) -> str:
+    conv_word = "high" if conviction >= 70 else ("moderate" if conviction >= 45 else "low")
+    risk_word = "low" if risk < 0.45 else ("elevated" if risk < 0.70 else "high")
+    parts = [f"{conv_word} conviction ({conviction:.0f}/100)",
+             f"{risk_word} risk ({risk*100:.0f}%)"]
+    if cluster_id is not None:
+        peers = [t for t in clusters[cluster_id] if t != ticker]
+        if peers:
+            parts.append("correlated w/ " + ", ".join(peers))
+    if final_w < pre_w - 1e-6:
+        parts.append(f"trimmed to cap {min(pos_cap, cluster_cap)*100:.0f}%")
+    if unaffordable and price:
+        parts.append(f"⚠ 1 share ≈ ${_fmt(price)} > allocation")
+    return "; ".join(parts)
